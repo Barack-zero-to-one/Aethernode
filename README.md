@@ -6,7 +6,7 @@
 
 ## The Problem
 
-Big Tech controls the pipes. Centralized servers can silence accounts, read private messages, hand data to governments, and erase entire conversations overnight. You do not own your communications — they do.
+Big Tech controls the pipes. Centralized servers can silence accounts, read private messages, hand data to governments, and erase entire conversations overnight. You do not own your communicationsthey do.
 
 ## The Solution
 
