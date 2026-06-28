@@ -26,6 +26,9 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.exceptions import InvalidSignature
 
+# Maximum bytes accepted from a single POST body — guards against memory exhaustion
+_MAX_BODY_BYTES: int = 64 * 1024  # 64 KB; far exceeds any valid AetherNode message
+
 # ─── Required fields every published message must carry ──────────────────────
 REQUIRED_FIELDS = {
     "version", "sender_pubkey", "recipient_pubkey",
@@ -151,6 +154,14 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path != "/publish":
             self._send_json(404, {"error": "Not found"})
+            return
+
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            content_length = 0
+        if content_length > _MAX_BODY_BYTES:
+            self._send_json(413, {"error": f"Request body exceeds {_MAX_BODY_BYTES} bytes"})
             return
 
         raw = self._read_body()
