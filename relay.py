@@ -113,11 +113,10 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _read_body(self) -> bytes | None:
-        length = int(self.headers.get("Content-Length", 0))
-        if length == 0:
+    def _read_body(self, content_length: int) -> bytes | None:
+        if content_length == 0:
             return None
-        return self.rfile.read(length)
+        return self.rfile.read(content_length)
 
     # ── GET ───────────────────────────────────────────────────────────────────
 
@@ -164,7 +163,7 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(413, {"error": f"Request body exceeds {_MAX_BODY_BYTES} bytes"})
             return
 
-        raw = self._read_body()
+        raw = self._read_body(content_length)
         if not raw:
             self._send_json(400, {"error": "Empty request body"})
             return
