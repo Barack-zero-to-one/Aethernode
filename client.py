@@ -2,9 +2,11 @@
 AetherNode Client — Cryptographic CLI
 
 Identity   : RSA-2048 keypair stored in ~/.aether/ (or $AETHER_HOME)
-Encryption : AES-256-GCM (message) + RSA-OAEP (AES key wrap) = hybrid E2E
+Encryption : AES-256-GCM (message, padded to a fixed-size bucket) + RSA-OAEP
+             (AES key wrap) = hybrid E2E
 Signing    : RSA-PSS + SHA-256 over canonical payload
-Transport  : urllib (stdlib) — no external HTTP libraries
+Transport  : Tor v3 .onion hidden services ONLY, over a local SOCKS5 proxy
+             (PySocks). Direct IP connections are refused.
 
 Commands:
   register                           — Show your public identity key
@@ -18,6 +20,7 @@ import hashlib
 import http.client
 import json
 import os
+import re
 import socket
 import sys
 import urllib.error
@@ -25,6 +28,7 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+import socks  # PySocks — SOCKS5 client used to route all relay traffic through Tor
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -112,13 +116,60 @@ def pubkey_address(pubkey_b64: str) -> str:
     return hashlib.sha256(base64.b64decode(pubkey_b64)).hexdigest()
 
 
+# ─── Padding (Traffic Analysis Resistance) ────────────────────────────────────
+# Every plaintext is padded to one of a small set of standardized sizes before
+# AES-GCM encryption, so ciphertext length alone can't be used to distinguish
+# message types (e.g. a one-byte read receipt vs. a multi-KB document) from
+# observed traffic — neither by the relay nor by a network observer.
+
+PAD_BUCKETS = (4 * 1024, 16 * 1024, 64 * 1024)  # 4 KB / 16 KB / 64 KB
+_LEN_PREFIX_SIZE = 4  # bytes; big-endian uint32 original-length prefix
+
+
+def pad_plaintext(plaintext: bytes) -> bytes:
+    """
+    Pad `plaintext` to the smallest bucket in PAD_BUCKETS that fits a 4-byte
+    big-endian length prefix plus the plaintext itself.
+
+    Padding is cryptographically random, not null bytes: the padded buffer is
+    encrypted with AES-256-GCM (authenticated encryption), so padding content
+    contributes nothing exploitable either way cryptographically — but random
+    bytes avoid leaving a recognizable repeated-byte run in the pre-ciphertext
+    buffer, which is cheap defense-in-depth against any future code that might
+    touch that buffer before encryption (e.g. compression, logging).
+
+    Raises ValueError if `plaintext` doesn't fit even the largest bucket.
+    """
+    needed = _LEN_PREFIX_SIZE + len(plaintext)
+    for bucket in PAD_BUCKETS:
+        if needed <= bucket:
+            prefix = len(plaintext).to_bytes(_LEN_PREFIX_SIZE, "big")
+            return prefix + plaintext + os.urandom(bucket - needed)
+    raise ValueError(
+        f"Message too large: {len(plaintext)} bytes exceeds the largest "
+        f"padding bucket ({PAD_BUCKETS[-1]} bytes, "
+        f"~{PAD_BUCKETS[-1] - _LEN_PREFIX_SIZE} usable bytes)."
+    )
+
+
+def unpad_plaintext(padded: bytes) -> bytes:
+    """Reverse of pad_plaintext: read the length prefix, return only the original bytes."""
+    if len(padded) < _LEN_PREFIX_SIZE:
+        raise ValueError("Padded plaintext shorter than the length prefix — corrupt data.")
+    orig_len = int.from_bytes(padded[:_LEN_PREFIX_SIZE], "big")
+    if orig_len > len(padded) - _LEN_PREFIX_SIZE:
+        raise ValueError("Corrupt padding: encoded length exceeds available data.")
+    return padded[_LEN_PREFIX_SIZE:_LEN_PREFIX_SIZE + orig_len]
+
+
 # ─── Hybrid Encryption ────────────────────────────────────────────────────────
 
 def encrypt_message(plaintext: str, recipient_public_key) -> dict:
     """
     Hybrid encryption:
-      1. AES-256-GCM encrypts the message (handles arbitrary length)
-      2. RSA-OAEP encrypts the ephemeral AES key (only recipient can unwrap)
+      1. Plaintext is padded to a fixed-size bucket (traffic analysis resistance)
+      2. AES-256-GCM encrypts the padded message (handles arbitrary length)
+      3. RSA-OAEP encrypts the ephemeral AES key (only recipient can unwrap)
 
     The AES-GCM auth tag is appended to the ciphertext by the AESGCM primitive,
     so integrity is verified automatically on decrypt.
@@ -129,7 +180,7 @@ def encrypt_message(plaintext: str, recipient_public_key) -> dict:
     nonce   = os.urandom(12)   # 96-bit GCM nonce (NIST SP 800-38D recommendation)
 
     aesgcm              = AESGCM(aes_key)
-    ciphertext_with_tag = aesgcm.encrypt(nonce, plaintext.encode("utf-8"), None)
+    ciphertext_with_tag = aesgcm.encrypt(nonce, pad_plaintext(plaintext.encode("utf-8")), None)
 
     encrypted_key = recipient_public_key.encrypt(
         aes_key,
@@ -152,6 +203,7 @@ def decrypt_message(payload: dict, private_key) -> str:
     Reverse of encrypt_message:
       1. RSA-OAEP unwraps the AES key using the recipient's private key
       2. AES-256-GCM decrypts (auth tag verified automatically — raises if tampered)
+      3. Padding is stripped to recover the original plaintext
     """
     encrypted_key       = base64.b64decode(payload["encrypted_key"])
     nonce               = base64.b64decode(payload["nonce"])
@@ -167,7 +219,8 @@ def decrypt_message(payload: dict, private_key) -> str:
     )
 
     aesgcm = AESGCM(aes_key)
-    return aesgcm.decrypt(nonce, ciphertext_with_tag, None).decode("utf-8")
+    padded_plaintext = aesgcm.decrypt(nonce, ciphertext_with_tag, None)
+    return unpad_plaintext(padded_plaintext).decode("utf-8")
 
 
 # ─── Signing & Verification ───────────────────────────────────────────────────
@@ -222,10 +275,115 @@ def verify_payload_signature(payload: dict) -> bool:
         return False
 
 
+# ─── Tor Transport (.onion enforcement + SOCKS5) ──────────────────────────────
+# AetherNode refuses to talk to anything but a Tor v3 hidden service. Connecting
+# directly to a bare IP/hostname would expose real network locations to any
+# observer on the link, defeating the protocol's core guarantee.
+
+_ONION_V3_RE = re.compile(r"^[a-z2-7]{56}\.onion$")
+
+DEFAULT_SOCKS_HOST = "127.0.0.1"
+DEFAULT_SOCKS_PORT = 9050  # Tor's default SocksPort
+_HTTP_TIMEOUT       = 45   # seconds — Tor circuit builds add real latency
+
+SOCKS_HOST = DEFAULT_SOCKS_HOST
+SOCKS_PORT = DEFAULT_SOCKS_PORT
+
+
+def normalize_relay_url(raw: str) -> str:
+    """
+    Validate that `raw` names a Tor v3 .onion address and return a normalized
+    'http://<onion>[:port]' URL.
+
+    This is a client-side guardrail, not a security boundary: it only checks
+    the *shape* of a v3 onion address (56 lowercase base32 chars + '.onion'),
+    not the embedded ed25519 key/checksum. Tor itself will simply fail to
+    resolve/connect to anything malformed or nonexistent. This check exists
+    purely to reject plaintext IPs/hostnames/https:// *before* any network
+    call, so a typo or a leftover TCP-era command can never silently leak
+    real IP metadata.
+
+    Raises ValueError (never sys.exit — this is a pure, unit-testable function).
+    """
+    candidate = raw.strip().rstrip("/")
+
+    if "://" in candidate:
+        scheme, _, rest = candidate.partition("://")
+        if scheme.lower() != "http":
+            raise ValueError(
+                f"unsupported scheme '{scheme}://' — only bare .onion addresses "
+                f"or 'http://<onion>' are accepted (not https:// — Tor already "
+                f"provides the encrypted transport)"
+            )
+        candidate = rest
+
+    host_part = candidate.split("/", 1)[0]
+    host, _, port = host_part.partition(":")
+
+    if not _ONION_V3_RE.match(host.lower()):
+        raise ValueError(
+            "not a valid Tor v3 .onion address "
+            "(expected 56 base32 chars + '.onion', e.g. '<56chars>.onion')"
+        )
+    if port and not port.isdigit():
+        raise ValueError(f"invalid port '{port}'")
+
+    return f"http://{host.lower()}" + (f":{port}" if port else "")
+
+
+def _require_onion_relay(raw: str) -> str:
+    """CLI boundary wrapper: pretty-print rejection + exit, reusing the ANSI helpers."""
+    try:
+        return normalize_relay_url(raw)
+    except ValueError as exc:
+        print(f"\n  {RED}{BOLD}✗ Invalid relay address: {raw!r}{RESET}")
+        print(f"  {RED}  {exc}{RESET}")
+        print(f"  {DIM}  AetherNode only connects to Tor v3 .onion hidden services via SOCKS5.{RESET}\n")
+        sys.exit(1)
+
+
+class _SocksHTTPConnection(http.client.HTTPConnection):
+    """
+    HTTPConnection that tunnels through a local Tor SOCKS5 proxy.
+
+    rdns=True is critical: it forces .onion hostname "resolution" to happen
+    *inside* Tor over the SOCKS protocol, instead of via a local DNS lookup
+    before the SOCKS handshake. .onion names are not real DNS names — a local
+    resolver would either fail outright or, on a misconfigured system, leak
+    the .onion hostname to whatever DNS resolver the OS is configured with.
+    Never set rdns=False here.
+    """
+    def connect(self):
+        self.sock = socks.socksocket()
+        self.sock.set_proxy(socks.SOCKS5, SOCKS_HOST, SOCKS_PORT, rdns=True)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect((self.host, self.port))
+
+
+class _SocksHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(_SocksHTTPConnection, req)
+
+
+_opener = None
+
+
+def _get_opener():
+    global _opener
+    if _opener is None:
+        # ProxyHandler({}) explicitly disables urllib's automatic
+        # environment-variable proxy detection (http_proxy/https_proxy). If
+        # left default, an env-configured HTTP proxy could silently intercept
+        # traffic ahead of our SOCKS5/_SocksHTTPHandler — a real leak vector
+        # this feature exists to close.
+        _opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _SocksHTTPHandler)
+    return _opener
+
+
 # ─── Network Helpers ──────────────────────────────────────────────────────────
 
 def _http_post(url: str, body: dict) -> dict:
-    """POST JSON to relay. Raises ConnectionError with a human-readable message."""
+    """POST JSON to relay over Tor. Raises ConnectionError with a human-readable message."""
     data = json.dumps(body).encode()
     req  = urllib.request.Request(
         url,
@@ -237,30 +395,42 @@ def _http_post(url: str, body: dict) -> dict:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with _get_opener().open(req, timeout=_HTTP_TIMEOUT) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode(errors="replace")
         raise ConnectionError(f"HTTP {exc.code}: {detail}") from exc
     except urllib.error.URLError as exc:
-        raise ConnectionError(f"Cannot reach relay: {exc.reason}") from exc
+        raise ConnectionError(
+            f"Cannot reach relay via Tor SOCKS5 proxy {SOCKS_HOST}:{SOCKS_PORT} "
+            f"({exc.reason}). Is Tor running and listening on that port?"
+        ) from exc
     except (socket.timeout, http.client.RemoteDisconnected) as exc:
-        raise ConnectionError("Connection timed out or was dropped by relay") from exc
+        raise ConnectionError(
+            "Connection timed out or was dropped (Tor circuit build can take "
+            "longer than a direct connection — try again)"
+        ) from exc
 
 
 def _http_get(url: str) -> dict:
-    """GET JSON from relay. Raises ConnectionError with a human-readable message."""
+    """GET JSON from relay over Tor. Raises ConnectionError with a human-readable message."""
     req = urllib.request.Request(url, headers={"User-Agent": "AetherNode/1.0"})
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with _get_opener().open(req, timeout=_HTTP_TIMEOUT) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode(errors="replace")
         raise ConnectionError(f"HTTP {exc.code}: {detail}") from exc
     except urllib.error.URLError as exc:
-        raise ConnectionError(f"Cannot reach relay: {exc.reason}") from exc
+        raise ConnectionError(
+            f"Cannot reach relay via Tor SOCKS5 proxy {SOCKS_HOST}:{SOCKS_PORT} "
+            f"({exc.reason}). Is Tor running and listening on that port?"
+        ) from exc
     except (socket.timeout, http.client.RemoteDisconnected) as exc:
-        raise ConnectionError("Connection timed out or was dropped by relay") from exc
+        raise ConnectionError(
+            "Connection timed out or was dropped (Tor circuit build can take "
+            "longer than a direct connection — try again)"
+        ) from exc
 
 
 # ─── Command: register ────────────────────────────────────────────────────────
@@ -298,7 +468,12 @@ def cmd_send(private_key, relay_url: str, recipient_b64: str, message: str):
 
     # Step 1: Hybrid encrypt
     print(f"  {DIM}[1/3] Encrypting  (AES-256-GCM + RSA-OAEP)...{RESET}", end=" ", flush=True)
-    enc = encrypt_message(message, recipient_public_key)
+    try:
+        enc = encrypt_message(message, recipient_public_key)
+    except ValueError as exc:
+        print(f"{RED}failed{RESET}")
+        print(f"\n  {RED}✗ {exc}{RESET}\n")
+        sys.exit(1)
     print(f"{GREEN}done{RESET}")
 
     # Step 2: Build and sign payload
@@ -393,8 +568,8 @@ def main():
         epilog="""
 examples:
   python client.py register
-  python client.py send http://localhost:8888 <BOB_PUBKEY> "Hello, free world"
-  python client.py fetch http://localhost:8888
+  python client.py send http://<56charbase32>.onion <BOB_PUBKEY> "Hello, free world"
+  python client.py fetch http://<56charbase32>.onion
 
   # Two identities on one machine (testing Alice ↔ Bob):
   AETHER_HOME=~/.aether_alice python client.py register
@@ -409,13 +584,21 @@ examples:
         help="Display your decentralized public identity key",
     )
 
-    p_send = sub.add_parser("send", help="Encrypt, sign, and broadcast a message")
-    p_send.add_argument("relay",         help="Relay URL  (e.g. http://localhost:8888)")
+    _socks_parent = argparse.ArgumentParser(add_help=False)
+    _socks_parent.add_argument(
+        "--socks-host", default=os.environ.get("AETHER_SOCKS_HOST", DEFAULT_SOCKS_HOST),
+        help=f"Tor SOCKS5 proxy host (default: {DEFAULT_SOCKS_HOST}, or $AETHER_SOCKS_HOST)")
+    _socks_parent.add_argument(
+        "--socks-port", type=int, default=int(os.environ.get("AETHER_SOCKS_PORT", DEFAULT_SOCKS_PORT)),
+        help=f"Tor SOCKS5 proxy port (default: {DEFAULT_SOCKS_PORT}, or $AETHER_SOCKS_PORT)")
+
+    p_send = sub.add_parser("send", parents=[_socks_parent], help="Encrypt, sign, and broadcast a message")
+    p_send.add_argument("relay",         help="Relay .onion address (e.g. http://<56chars>.onion)")
     p_send.add_argument("recipient_key", help="Recipient's base64 public key")
     p_send.add_argument("message",       help="Plaintext message to send")
 
-    p_fetch = sub.add_parser("fetch", help="Fetch, verify, and decrypt your inbox")
-    p_fetch.add_argument("relay", help="Relay URL  (e.g. http://localhost:8888)")
+    p_fetch = sub.add_parser("fetch", parents=[_socks_parent], help="Fetch, verify, and decrypt your inbox")
+    p_fetch.add_argument("relay", help="Relay .onion address (e.g. http://<56chars>.onion)")
 
     args = parser.parse_args()
 
@@ -423,15 +606,19 @@ examples:
         parser.print_help()
         sys.exit(0)
 
+    global SOCKS_HOST, SOCKS_PORT
+    SOCKS_HOST = getattr(args, "socks_host", DEFAULT_SOCKS_HOST)
+    SOCKS_PORT = getattr(args, "socks_port", DEFAULT_SOCKS_PORT)
+
     # Bootstrap identity — generates keys on first launch, silent on subsequent runs
     private_key = load_or_generate_identity()
 
     if args.command == "register":
         cmd_register(private_key)
     elif args.command == "send":
-        cmd_send(private_key, args.relay.rstrip("/"), args.recipient_key, args.message)
+        cmd_send(private_key, _require_onion_relay(args.relay), args.recipient_key, args.message)
     elif args.command == "fetch":
-        cmd_fetch(private_key, args.relay.rstrip("/"))
+        cmd_fetch(private_key, _require_onion_relay(args.relay))
 
 
 if __name__ == "__main__":
