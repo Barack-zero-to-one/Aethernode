@@ -17,6 +17,7 @@ Architecture:
 
 import argparse
 import base64
+import fcntl
 import http.server
 import json
 import os
@@ -33,12 +34,14 @@ from urllib.parse import urlparse, parse_qs
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
-# Maximum bytes accepted from a single POST body — guards against memory exhaustion.
-# Worst case is a plaintext padded to the largest bucket (65536 B, see client.py
-# PAD_BUCKETS) -> AES-GCM ciphertext+tag (65552 B) -> base64 (87404 chars) plus
-# the other JSON fields (sender_pubkey/encrypted_key/signature/recipient_id/
-# timestamp/punctuation), measured at 88,724 bytes. 128 KiB gives ~48% headroom.
-_MAX_BODY_BYTES: int = 128 * 1024  # 128 KiB
+from protocol import MAX_PUBLISH_BODY_BYTES
+
+# Maximum bytes accepted from a single POST body — guards against memory
+# exhaustion. Derived from protocol.MAX_PUBLISH_BODY_BYTES (the worst-case
+# payload size for client.py's largest padding bucket) with roughly 50%
+# headroom, so this cap can never silently fall out of sync with the
+# client's padding scheme the way a hand-copied constant could.
+_MAX_BODY_BYTES: int = MAX_PUBLISH_BODY_BYTES + MAX_PUBLISH_BODY_BYTES // 2
 
 # ─── Required fields every published message must carry ──────────────────────
 REQUIRED_FIELDS = {
@@ -56,11 +59,39 @@ DB_LOCK = threading.Lock()
 
 # ─── Unix Socket Path ─────────────────────────────────────────────────────────
 
+def _acquire_relay_lock(socket_path: str):
+    """
+    Hold an exclusive advisory lock (flock) on "<socket_path>.lock" for the
+    lifetime of this process, so a second relay instance accidentally started
+    against the same socket path refuses to start instead of silently
+    stealing or deleting the first instance's live socket. The OS releases
+    the lock automatically if this process dies or is killed, so — unlike a
+    plain PID file — the lock can never go stale and never needs cleanup.
+
+    The caller must keep the returned file object alive for as long as the
+    relay is running; closing it (including via process exit) releases the
+    lock.
+    """
+    lock_path = f"{socket_path}.lock"
+    lock_file = open(lock_path, "w")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print(f"  ERROR: another relay instance is already running on {socket_path}", file=sys.stderr)
+        print(f"  (held by whichever process holds a lock on {lock_path})", file=sys.stderr)
+        sys.exit(1)
+    lock_file.write(str(os.getpid()))
+    lock_file.flush()
+    return lock_file
+
+
 def _prepare_socket_path(path: str) -> None:
     """
     Remove a stale socket file left behind by a crashed/killed relay process —
     bind() fails with "address already in use" otherwise — while refusing to
-    touch anything that isn't actually a socket.
+    touch anything that isn't actually a socket. Must only be called after
+    _acquire_relay_lock() has succeeded, so the file being inspected here is
+    guaranteed to belong to a dead process rather than a live one.
     """
     p = Path(path)
     if p.exists():
@@ -68,7 +99,12 @@ def _prepare_socket_path(path: str) -> None:
             print(f"  ERROR: {p} already exists and is not a Unix socket.", file=sys.stderr)
             print(f"  Refusing to delete it automatically — remove or rename it, then restart.", file=sys.stderr)
             sys.exit(1)
-        p.unlink()
+        try:
+            p.unlink()
+        except OSError as exc:
+            print(f"  ERROR: could not remove stale socket {p}: {exc}", file=sys.stderr)
+            print(f"  Check its ownership/permissions, then restart.", file=sys.stderr)
+            sys.exit(1)
     p.parent.mkdir(parents=True, exist_ok=True)
 
 
@@ -292,27 +328,45 @@ def main():
 
     db = init_db(args.db)
 
+    # Held for the lifetime of the process — guarantees only one relay
+    # instance can ever bind/unlink this socket path at a time.
+    _lock = _acquire_relay_lock(args.socket_path)
+
     _prepare_socket_path(args.socket_path)
-    server = RelayUnixHTTPServer(args.socket_path, RelayHandler)
-    os.chmod(args.socket_path, 0o660)  # local-only; group access needed by the Tor process — see README
-    server.db = db
 
-    print("  ╔══════════════════════════════════════╗")
-    print("  ║       AetherNode Relay  v1.0         ║")
-    print("  ╚══════════════════════════════════════╝")
-    print(f"  Listening   : unix:{args.socket_path}")
-    print(f"  Storage     : {args.db}")
-    print(f"  Zero-Knowledge: relay cannot decrypt stored payloads")
-    print(f"  No public network interface — reachable only via a Tor onion service.")
-    print(f"  Press Ctrl+C to stop.\n")
-
+    server = None
     try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\n  Relay stopped cleanly.")
+        server = RelayUnixHTTPServer(args.socket_path, RelayHandler)
+        os.chmod(args.socket_path, 0o660)  # local-only; group access needed by the Tor process — see README
+        server.db = db
+
+        print("  ╔══════════════════════════════════════╗")
+        print("  ║       AetherNode Relay  v1.0         ║")
+        print("  ╚══════════════════════════════════════╝")
+        print(f"  Listening   : unix:{args.socket_path}")
+        print(f"  Storage     : {args.db}")
+        print(f"  Zero-Knowledge: relay cannot decrypt stored payloads")
+        print(f"  No public network interface — reachable only via a Tor onion service.")
+        print(f"  Press Ctrl+C to stop.\n")
+
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            print("\n  Relay stopped cleanly.")
     finally:
-        server.shutdown()
-        db.close()
+        # Each cleanup step is independently guarded so a failure in one
+        # (e.g. a handler thread still touching `db` when close() runs, since
+        # daemon_threads=True means in-flight threads are never joined first)
+        # can never prevent the others from running.
+        if server is not None:
+            try:
+                server.shutdown()
+            except Exception:
+                pass
+        try:
+            db.close()
+        except Exception:
+            pass
         try:
             os.unlink(args.socket_path)
         except OSError:

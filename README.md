@@ -6,17 +6,11 @@
 
 ## The Problem
 
-Big Tech controls the pipes. Centralized servers can silence accounts, read private messages, hand data to governments, and erase entire conversations overnight. You do not own your communicationsthey do.
+Centralized messaging infrastructure concentrates an extraordinary amount of trust in a small number of operators. A centralized server can suspend an account without appeal, read the content of private conversations, hand user data to a government on request, or erase an entire conversation history overnight. Users of such systems do not own their communications; the operator does. AetherNode is designed to remove that operator from the trust model entirely.
 
 ## The Solution
 
-AetherNode removes the trusted third party entirely:
-
-- **Identity is a keypair.** No username. No account. No phone number. Your RSA key *is* you.
-- **Encryption is end-to-end.** Messages are AES-256 encrypted before they leave your machine. The relay sees ciphertext — always.
-- **Censorship is structurally impossible.** The relay is a dumb bulletin board. It cannot read what it stores. Anyone can run one.
-- **The network layer is anonymous.** All traffic runs over Tor v3 hidden services — there is no public IP to seize, block, or subpoena, and no network observer can see who is talking to whom.
-- **Traffic looks uniform.** Every message is padded to a fixed size before encryption, so ciphertext length can't be used to guess whether it's a one-line reply or a document.
+AetherNode achieves this by eliminating the trusted third party at every layer of the system. Identity is represented by a cryptographic keypair rather than a username, an account, or a phone number; possession of the private key is the only form of authentication the protocol recognizes. Every message is encrypted end to end with AES-256 before it ever leaves the sender's machine, so the relay that transports it handles nothing but ciphertext. Because the relay functions as a blind bulletin board with no ability to read what it stores, and because anyone is free to operate one, no single party is in a position to censor the network. The network layer itself is anonymized, since all traffic between clients and relays travels exclusively over Tor v3 hidden services, meaning there is no public IP address to seize, block, or subpoena, and no network observer can determine who is communicating with whom. Finally, every message is padded to a fixed size before encryption, so the length of the resulting ciphertext cannot be used to distinguish a short acknowledgment from a lengthy document.
 
 ---
 
@@ -64,7 +58,7 @@ AetherNode removes the trusted third party entirely:
 
 ## Quick Start
 
-`relay.py` binds a Unix domain socket and requires Linux, macOS, or WSL — it has no public network interface at all. `client.py` runs anywhere Python + Tor are available (including native Windows) as long as it's pointed at a relay's `.onion` address. Tor must be installed and its SocksPort running (default `127.0.0.1:9050`) before using the client; see **Deployment** below for setting up the relay's hidden service.
+`relay.py` binds a Unix domain socket and requires Linux, macOS, or WSL, since it has no public network interface at all. `client.py` runs anywhere Python and Tor are available, including native Windows, as long as it is pointed at a relay's `.onion` address. Tor must already be installed with its SocksPort running, on `127.0.0.1:9050` by default, before the client can be used; see the Deployment section below for setting up the relay's hidden service.
 
 ```bash
 pip install -r requirements.txt
@@ -90,7 +84,7 @@ AETHER_HOME=~/.aether_bob python client.py fetch http://<56charbase32>.onion
 # → Content : Hello, free world
 ```
 
-> **Windows:** replace `AETHER_HOME=~/.aether_bob` with `set AETHER_HOME=%USERPROFILE%\.aether_bob` before the command.
+On Windows, replace `AETHER_HOME=~/.aether_bob` with `set AETHER_HOME=%USERPROFILE%\.aether_bob` before the command.
 
 ---
 
@@ -110,10 +104,7 @@ AETHER_HOME=~/.aether_bob python client.py fetch http://<56charbase32>.onion
 
 ## Why This Is Censorship-Resistant
 
-- **No accounts.** There is nothing to ban. Your identity is two files in `~/.aether/`.
-- **The relay is blind.** It stores encrypted bytes it cannot interpret. No content policy can apply to content no one can read.
-- **Anyone can run a relay.** One node goes down? Point your client at another `.onion` address. The protocol *is* the network.
-- **No IP to block.** The relay has no public address — it's only reachable through its Tor hidden service, which can't be blocked by filtering an IP or seizing a server.
+AetherNode's resistance to censorship follows from its design rather than from any policy commitment. There are no accounts to suspend, since a user's identity consists of nothing more than two files stored locally in `~/.aether/`. The relay itself is blind: it stores encrypted bytes it has no ability to interpret, so no content policy can be applied to content nobody can read. Because anyone can operate a relay, the failure or seizure of a single node simply means pointing a client at a different `.onion` address; the protocol itself constitutes the network, rather than any particular server within it. And because a relay has no public address at all, reachable only through its Tor hidden service, there is no IP address to filter and no server to seize in order to take it offline.
 
 ---
 
@@ -125,20 +116,24 @@ AETHER_HOME=~/.aether_bob python client.py fetch http://<56charbase32>.onion
 | Tamper-evident | RSA-PSS signature covers the entire payload; any modification breaks verification |
 | Zero-knowledge relay | Relay stores ciphertext blobs; signature check reveals nothing about content |
 | Integrity of AES plaintext | GCM auth tag detects any ciphertext corruption before decryption |
-| Identity portability | Keypair is a PEM file — back it up, move it, run it on any machine |
-| No metadata leakage | No usernames, emails, or phone numbers. Recipients are addressed by `SHA-256(recipient_pubkey)` — the relay never receives or stores a recipient's raw public key |
+| Identity portability | Keypair is a PEM file, easy to back up, move, and run on any machine |
+| No metadata leakage | No usernames, emails, or phone numbers. Recipients are addressed by `SHA-256(recipient_pubkey)`, so the relay never receives or stores a recipient's raw public key |
 | Replay/duplicate protection | `signature` is `UNIQUE` in the relay's database; re-submitting a captured payload is rejected with `409` instead of duplicating the message |
-| Transport anonymity | The relay has no public IP/port — it binds a Unix socket only, reachable exclusively through a Tor v3 hidden service. The client hard-rejects any target that isn't a `.onion` address, and routes every request through Tor's SOCKS5 proxy with remote (in-Tor) hostname resolution |
+| Transport anonymity | The relay has no public IP or port; it binds a Unix socket only, reachable exclusively through a Tor v3 hidden service. The client hard-rejects any target that isn't a `.onion` address, and routes every request through Tor's SOCKS5 proxy with remote, in-Tor hostname resolution |
 | Traffic-size unlinkability | Every plaintext is padded to one of `{4 KB, 16 KB, 64 KB}` before AES-256-GCM encryption, so ciphertext length alone can't distinguish a short message from a long one |
+| Defense-in-depth transport enforcement | The `.onion`-only requirement is checked both at the command-line entry point and again immediately before any network request is made, so importing `client.py` as a library cannot bypass it |
+| Concurrency safety | The relay holds an exclusive lock on its socket path for its entire lifetime; a second instance started against the same path refuses to run rather than silently taking over, or deleting, the first instance's socket |
 
 ---
 
 ## Architecture
 
 ```
-relay.py      RelayUnixHTTPServer  (Python stdlib), AF_UNIX only — no TCP listener,
-                                    no public interface. Tor forwards its onion
+relay.py      RelayUnixHTTPServer  (Python stdlib), AF_UNIX only, no TCP listener
+                                    and no public interface. Tor forwards its onion
                                     service's HiddenServicePort to this socket file.
+                                    An exclusive process lock prevents two instances
+                                    from ever binding the same socket path.
               SQLite storage       (Python stdlib)
               POST /publish  →  verify RSA-PSS sig → reject dup signature → store encrypted blob
               GET  /fetch    →  return blobs by recipient_id (SHA-256 of recipient pubkey)
@@ -148,14 +143,21 @@ client.py     RSA-2048 keypair     (cryptography)
               RSA-OAEP key wrap    (cryptography)
               RSA-PSS sign/verify  (cryptography)
               ANSI terminal output (zero dependencies)
-              SOCKS5-over-Tor      (PySocks) — all HTTP traffic to .onion relays
+              SOCKS5-over-Tor      (PySocks) — all HTTP traffic to .onion relays,
+                                    with the .onion address re-validated at the
+                                    point of the network call itself
+
+protocol.py   Shared constants     (Python stdlib) — padding bucket sizes and the
+                                    derived maximum request size, imported by both
+                                    relay.py and client.py so the two can never drift
+                                    out of sync with each other
 ```
 
 ---
 
 ## Deployment (Tor Hidden Service)
 
-`relay.py` never talks to Tor directly — it only binds a Unix socket. You configure Tor itself (via `torrc`) to publish that socket as a v3 hidden service:
+`relay.py` never communicates with Tor directly; it does nothing more than bind a Unix domain socket. Tor itself, configured through `torrc`, is responsible for publishing that socket as a v3 hidden service.
 
 ```
 # /etc/tor/torrc
@@ -165,10 +167,12 @@ HiddenServicePort 80 unix:/path/to/aether-relay.sock
 
 ```bash
 sudo systemctl restart tor
-cat /var/lib/tor/aethernode/hostname   # → your relay's <56chars>.onion address
+cat /var/lib/tor/aethernode/hostname   # your relay's <56chars>.onion address
 ```
 
-The socket file must exist (i.e. `relay.py` must have started at least once) and be readable/writable by whichever user Tor runs as (e.g. `debian-tor` on Debian/Ubuntu, `_tor` on macOS Homebrew) — put the relay process and the Tor process in the same group, or adjust `os.chmod` in `relay.py` accordingly. Start `relay.py` before (or via the same systemd unit ordered before) Tor, so the socket exists when Tor tries to forward to it.
+The socket file must exist before Tor attempts to forward to it, which means `relay.py` needs to have started at least once, and it must be readable and writable by whichever user Tor runs as, such as `debian-tor` on Debian and Ubuntu or `_tor` on macOS installed via Homebrew. The simplest way to satisfy this is to place the relay process and the Tor process in the same group, or to adjust the permission bits `relay.py` sets on the socket file accordingly. If both services are managed by systemd, order the relay's unit before Tor's so the socket already exists by the time Tor starts.
+
+On startup, `relay.py` acquires an exclusive advisory lock tied to its socket path before it binds anything. If a previous instance is still running against the same path, whether because of an accidental double launch or because a process manager restarted the relay while the old instance was still shutting down, the new process refuses to start rather than silently taking over, or deleting, a socket that another instance still depends on. Because the lock is held by the operating system for the lifetime of the process, it is released automatically if the relay crashes or is killed, so it can never go stale and never requires manual cleanup.
 
 ---
 
@@ -178,10 +182,10 @@ The socket file must exist (i.e. `relay.py` must have started at least once) and
 pip install -r requirements.txt
 ```
 
-`cryptography` is used by both `relay.py` (signature verification) and `client.py` (all crypto). `PySocks` is used only by `client.py`, to speak SOCKS5 to Tor — the relay makes no outbound network calls and doesn't need it. Everything else — HTTP server, SQLite, JSON, base64, sockets — is Python standard library.
+AetherNode depends on two third-party packages, both listed in `requirements.txt`. The `cryptography` library provides every cryptographic primitive used by `relay.py`, for signature verification, and by `client.py`, for the full encryption and signing pipeline. `PySocks` is used exclusively by `client.py` to speak the SOCKS5 protocol to Tor; the relay makes no outbound network connections of its own and does not require it. `protocol.py`, which holds the padding bucket sizes and the derived request-size limit shared by both programs, depends on nothing beyond the Python standard library. Everything else involved, including the HTTP server, SQLite storage, JSON handling, and socket plumbing, comes from the standard library that ships with Python.
 
 ---
 
-*AetherNode is a protocol reference implementation. For production: relay-to-relay gossip for redundancy, and message TTL / expiry policies.*
+AetherNode is a reference implementation of the protocol rather than a hardened, production-ready deployment. A production deployment would additionally benefit from relay-to-relay gossip for redundancy and from a message expiry policy bounding how long a relay retains undelivered messages.
 
-> **Note:** this is a breaking change from earlier versions — the relay is no longer reachable over plain TCP/IP at all, only via its Tor `.onion` address, and message payloads are now padded before encryption. Delete any pre-existing `aether.db` and `aether-relay.sock`, and reconfigure Tor per **Deployment** above, before running this version.
+This release contains two breaking changes relative to earlier versions. The relay is no longer reachable over plain TCP/IP under any circumstance; it is reachable exclusively through its Tor `.onion` address. Message payloads are now padded before encryption, which changes their size on the wire. Anyone upgrading from an earlier version should delete any existing `aether.db` and `aether-relay.sock`, and reconfigure Tor according to the Deployment section above, before running this version.
