@@ -39,6 +39,8 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
+import ratelimit
+
 # ─── Constants ──────────────────────────────────────────────────────────────
 
 RELAY_KEY_FILE  = "relay_key.pem"
@@ -400,6 +402,13 @@ class GossipUnixTLSServer(socketserver.ThreadingMixIn, HTTPServer):
             if fingerprint is None or self.trust_store.is_blacklisted(fingerprint):
                 return
 
+            # Stashed on the socket itself (not a server-wide attribute,
+            # since this is per-connection) so GossipHandler can read the
+            # already-verified peer identity back via self.connection.
+            # peer_fingerprint — BaseHTTPRequestHandler's inherited
+            # StreamRequestHandler.setup() sets self.connection = self.request.
+            tls_request.peer_fingerprint = fingerprint
+
             self.RequestHandlerClass(tls_request, client_address, self)
         finally:
             try:
@@ -480,6 +489,25 @@ class GossipHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": f"Invalid JSON: {exc}"})
             return
 
+        # Cheap, indexed short-circuit for the common case in a mesh: most
+        # incoming pushes are duplicates of something already delivered by
+        # another peer. Skips signature verification and rate-limit budget
+        # entirely for messages that were always going to be rejected by
+        # insert_message_and_maybe_gossip's own UNIQUE-constraint dedup.
+        signature = payload.get("signature")
+        if isinstance(signature, str) and message_exists(self.server.db, self.server.db_lock, signature):
+            self._send_json(200, {"status": "duplicate"})
+            return
+
+        # The connecting peer's mTLS identity is already trustworthy at
+        # this point (established by the handshake itself, before any
+        # application data was even read), unlike a client's self-declared
+        # sender_pubkey — so global and per-peer budget are checked together.
+        peer_fingerprint = getattr(self.connection, "peer_fingerprint", None)
+        if peer_fingerprint is None or not self.server.gossip_push_limiter.allow(peer_fingerprint):
+            self._send_json(429, {"error": "rate limit exceeded"})
+            return
+
         error = self.server.validate_publish(payload)
         if error:
             self._send_json(400, {"error": error})
@@ -504,6 +532,25 @@ class GossipHandler(BaseHTTPRequestHandler):
 
 
 # ─── Shared Insert + Dedup-Gated Re-Gossip ─────────────────────────────────────
+
+def message_exists(db: sqlite3.Connection, db_lock: threading.Lock, signature: str) -> bool:
+    """
+    Cheap, indexed (signature already has a UNIQUE constraint) existence
+    check, used to short-circuit the common case in a mesh — a duplicate
+    arriving via gossip flood — before paying for signature verification
+    or consuming rate-limit budget on a message that was always going to
+    be rejected by insert_message_and_maybe_gossip's own UNIQUE-constraint
+    dedup anyway. That INSERT-time check remains the authoritative one
+    (it's atomic; this pre-check has a narrow, harmless race window
+    against a concurrent identical insert, which just means occasionally
+    paying the full validation+insert cost for what turns out to be a
+    duplicate).
+    """
+    with db_lock:
+        return db.execute(
+            "SELECT 1 FROM messages WHERE signature = ? LIMIT 1", (signature,)
+        ).fetchone() is not None
+
 
 def insert_message_and_maybe_gossip(
     db: sqlite3.Connection,
@@ -653,6 +700,14 @@ def _push_to_peer(peer: PeerConfig, body: bytes, own_cert_path: Path, own_key_pa
         conn.request("POST", "/gossip/publish", body=body, headers={"Content-Type": "application/json"})
         resp = conn.getresponse()
         _read_bounded_response(resp, max_body_bytes)
+        if resp.status == 429:
+            # No retry here by design (push is fire-and-forget); the next
+            # anti-entropy round from the peer's own side will naturally
+            # re-offer this message once its rate-limit budget refills,
+            # since a 429'd push was never inserted anywhere. Logged only
+            # for operator visibility into fan-out throttling.
+            print(f"  [gossip] push to peer '{peer.label}' was rate-limited — will be "
+                  f"picked up by anti-entropy instead", file=sys.stderr)
     except Exception as exc:
         # An unreachable peer is expected steady state under eventual
         # consistency, not a fatal condition — log and move on.
@@ -707,6 +762,7 @@ class AntiEntropySync:
     def __init__(self, db: sqlite3.Connection, db_lock: threading.Lock, trust_store: TrustStore,
                  validate_publish, gossip_ctx: GossipContext, own_cert_path: Path, own_key_path: Path,
                  direct_transport_unlocked: bool, max_body_bytes: int,
+                 gossip_pull_limiter: "ratelimit.RateLimiter",
                  interval_s: int = DEFAULT_ANTI_ENTROPY_INTERVAL):
         self.db = db
         self.db_lock = db_lock
@@ -717,6 +773,7 @@ class AntiEntropySync:
         self.own_key_path = own_key_path
         self.direct_transport_unlocked = direct_transport_unlocked
         self.max_body_bytes = max_body_bytes
+        self.gossip_pull_limiter = gossip_pull_limiter
         self.interval_s = interval_s
         # Keyed by peer.fingerprint (the value load_peers() actually
         # validates as unique), not peer.label — a free-text field two
@@ -759,17 +816,42 @@ class AntiEntropySync:
             data = json.loads(body)
             max_id = since_id
             for item in data.get("messages", []):
-                # The cursor must advance for every item this peer reports,
-                # whether or not it validates — otherwise a single
-                # unparseable batch (a Byzantine peer, or a future
-                # version-skew mismatch) makes every future round re-request
-                # the exact same since_id and get the exact same stuck page,
-                # forever. "How far I've paged through this peer's log" and
-                # "did I accept this particular item" are separate questions.
-                max_id = max(max_id, item["id"])
                 payload = item["payload"]
+                signature = payload.get("signature")
+
+                if isinstance(signature, str) and message_exists(self.db, self.db_lock, signature):
+                    # Already have it — permanent fact, safe to page past.
+                    max_id = max(max_id, item["id"])
+                    continue
+
+                if not self.gossip_pull_limiter.check_global():
+                    # Budget exhausted for this round. Unlike a validation
+                    # failure below, this is a TEMPORARY condition — the
+                    # message is still wanted, just not right now. Do NOT
+                    # advance max_id past this point, so the next round
+                    # (interval_s later) re-requests from here and retries,
+                    # instead of silently and permanently losing it the way
+                    # advancing past it would.
+                    break
+
+                # The cursor must advance past a PERMANENTLY invalid item
+                # (whether or not it validates), or a single unparseable
+                # batch (a Byzantine peer, or a future version-skew
+                # mismatch) would make every future round re-request the
+                # exact same since_id and get the exact same stuck page,
+                # forever. "How far I've paged through this peer's log" and
+                # "did I accept this particular item" are separate questions
+                # — but only for permanent outcomes; see the rate-limit
+                # check above and below for the temporary case.
                 if self.validate_publish(payload) is not None:
+                    max_id = max(max_id, item["id"])
                     continue  # malformed/unsigned data from a peer — skip it, don't crash the loop
+
+                if not self.gossip_pull_limiter.check_identity(peer.fingerprint):
+                    self.gossip_pull_limiter.refund_global()
+                    break  # per-peer budget exhausted — same temporary treatment as above
+
+                max_id = max(max_id, item["id"])
                 received_at = datetime.now(timezone.utc).isoformat()
                 insert_message_and_maybe_gossip(
                     self.db, self.db_lock, payload, payload["recipient_id"], received_at, self.gossip_ctx,
