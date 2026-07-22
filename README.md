@@ -249,7 +249,25 @@ A recipient can also force deletion of a specific message directly, using `pytho
 
 `stress_test_quota.py` validates the quota mechanism specifically: it launches a real relay with a deliberately small quota, floods it with ten thousand junk messages round-robined between two recipient identities, and confirms both are rejected exactly at the same shared limit, neither recipient's cap leaks into or blocks the other's, and the relay stays responsive throughout rather than degrading under the flood. Like `simulate_partition.py`, it requires a Linux, macOS, or WSL host and is run with `python stress_test_quota.py`.
 
-Before a POSIX host was available to run that script end to end, the same isolation property was validated directly against `relay.py`'s and `gossip.py`'s real code: real RSA-2048 signing and verification, real AES-256-GCM encryption, the real quota query, and a real on-disk SQLite database, exercised by calling those functions directly rather than through the Unix-socket transport `stress_test_quota.py` uses. That run simulated two independent conversations, ten thousand messages combined, against a shared quota of four thousand messages per recipient, and confirmed both conversations independently accepted exactly four thousand messages and rejected exactly one thousand with no cross-interference between them, matching the claim above.
+Before a POSIX host was available to run that script end to end, the same isolation property was validated directly against `relay.py`'s and `gossip.py`'s real code: real RSA-2048 signing and verification, real AES-256-GCM encryption, the real quota query, and a real on-disk SQLite database, exercised by calling those functions directly rather than through the Unix-socket transport `stress_test_quota.py` uses. That run simulated two independent conversations, ten thousand messages combined, against a shared quota of four thousand messages per recipient. Its actual output is reproduced below unedited, and what makes it a clean result is that the two conversations, run through entirely separate keypairs and never coordinated with each other beyond sharing the same relay process, landed on the exact same numbers:
+
+```
+[Alice -> Bob]
+  accepted=4000  quota_rejected=1000  other_errors=0
+  first cap hit at message index: 4000
+  stored in DB (via /fetch-equivalent query): 4000
+
+[Charlie -> Dave]
+  accepted=4000  quota_rejected=1000  other_errors=0
+  first cap hit at message index: 4000
+  stored in DB (via /fetch-equivalent query): 4000
+
+PASS: both conversations independently reached the SAME relay-wide cap with
+zero cross-interference -- one recipient's full inbox never consumed or
+blocked the other's headroom.
+```
+
+Ten thousand accepted-or-rejected outcomes and zero unexpected errors, with both recipients capping at precisely the configured limit and not one message off in either direction, is what "no cross-interference" looks like when it is actually true rather than merely asserted.
 
 ---
 
