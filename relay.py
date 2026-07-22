@@ -5,28 +5,40 @@ The relay is a dumb bulletin board. It stores encrypted, signed blobs and
 returns them on request. It cannot decrypt messages and cannot forge signatures —
 any tampered payload is rejected by the client's verification step.
 
+The relay has no public network presence: it binds a Unix domain socket only.
+Tor (configured manually via torrc — see README § Deployment) forwards a v3
+onion service's HiddenServicePort directly to that socket file.
+
 Architecture:
-  ThreadingHTTPServer (stdlib)  — concurrent request handling
+  RelayUnixHTTPServer (stdlib)  — concurrent request handling over AF_UNIX
   SQLite (stdlib)               — persistent message storage
   cryptography lib              — RSA-PSS signature verification (anti-spam)
 """
 
+import argparse
+import base64
 import http.server
+import json
+import os
+import socket
 import socketserver
 import sqlite3
-import json
-import base64
-import threading
-import argparse
+import stat
 import sys
+import threading
 from datetime import datetime, timezone
+from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
-# Maximum bytes accepted from a single POST body — guards against memory exhaustion
-_MAX_BODY_BYTES: int = 64 * 1024  # 64 KB; far exceeds any valid AetherNode message
+# Maximum bytes accepted from a single POST body — guards against memory exhaustion.
+# Worst case is a plaintext padded to the largest bucket (65536 B, see client.py
+# PAD_BUCKETS) -> AES-GCM ciphertext+tag (65552 B) -> base64 (87404 chars) plus
+# the other JSON fields (sender_pubkey/encrypted_key/signature/recipient_id/
+# timestamp/punctuation), measured at 88,724 bytes. 128 KiB gives ~48% headroom.
+_MAX_BODY_BYTES: int = 128 * 1024  # 128 KiB
 
 # ─── Required fields every published message must carry ──────────────────────
 REQUIRED_FIELDS = {
@@ -40,6 +52,24 @@ _MAX_RECIPIENT_ID_LEN = 128
 
 # Serialize all SQLite access through one lock (connection is not thread-safe)
 DB_LOCK = threading.Lock()
+
+
+# ─── Unix Socket Path ─────────────────────────────────────────────────────────
+
+def _prepare_socket_path(path: str) -> None:
+    """
+    Remove a stale socket file left behind by a crashed/killed relay process —
+    bind() fails with "address already in use" otherwise — while refusing to
+    touch anything that isn't actually a socket.
+    """
+    p = Path(path)
+    if p.exists():
+        if not stat.S_ISSOCK(p.stat().st_mode):
+            print(f"  ERROR: {p} already exists and is not a Unix socket.", file=sys.stderr)
+            print(f"  Refusing to delete it automatically — remove or rename it, then restart.", file=sys.stderr)
+            sys.exit(1)
+        p.unlink()
+    p.parent.mkdir(parents=True, exist_ok=True)
 
 
 # ─── Database ─────────────────────────────────────────────────────────────────
@@ -106,6 +136,11 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         print(f"  [{ts}] {fmt % args}", file=sys.stderr)
+
+    def address_string(self):
+        # AF_UNIX client_address is '' — the default implementation
+        # (self.client_address[0]) would raise IndexError on that.
+        return "unix-socket"
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -222,11 +257,24 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
 
-# ─── Threaded HTTP Server ─────────────────────────────────────────────────────
+# ─── Threaded HTTP Server (Unix Domain Socket) ────────────────────────────────
 
-class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
-    """One thread per connection — keeps the relay responsive under load."""
-    daemon_threads = True
+class RelayUnixHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    """
+    One thread per connection, bound to a Unix domain socket instead of a
+    TCP/IP socket — the relay has no public network presence at all.
+    """
+    address_family = socket.AF_UNIX
+    daemon_threads  = True
+
+    def server_bind(self):
+        # HTTPServer.server_bind() assumes server_address is an (host, port)
+        # tuple — it calls socket.getfqdn(host) to set self.server_name. For
+        # AF_UNIX, server_address is a filesystem path string, so that logic
+        # is meaningless; skip straight to TCPServer's plain bind.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = str(self.server_address)  # cosmetic only, unused for routing
+        self.server_port = 0
 
 
 # ─── Entry Point ──────────────────────────────────────────────────────────────
@@ -235,25 +283,27 @@ def main():
     parser = argparse.ArgumentParser(
         description="AetherNode Relay — Zero-Knowledge Decentralized Message Relay"
     )
-    parser.add_argument("--port", type=int, default=8888,
-                        help="Port to listen on (default: 8888)")
-    parser.add_argument("--host", default="0.0.0.0",
-                        help="Interface to bind to (default: 0.0.0.0)")
+    parser.add_argument("--socket-path", default="./aether-relay.sock",
+                        help="Unix domain socket path to bind (default: ./aether-relay.sock). "
+                             "Point Tor's 'HiddenServicePort 80 unix:<this path>' at it.")
     parser.add_argument("--db", default="aether.db",
                         help="SQLite database path; use ':memory:' for ephemeral (default: aether.db)")
     args = parser.parse_args()
 
     db = init_db(args.db)
 
-    server = ThreadingHTTPServer((args.host, args.port), RelayHandler)
+    _prepare_socket_path(args.socket_path)
+    server = RelayUnixHTTPServer(args.socket_path, RelayHandler)
+    os.chmod(args.socket_path, 0o660)  # local-only; group access needed by the Tor process — see README
     server.db = db
 
     print("  ╔══════════════════════════════════════╗")
     print("  ║       AetherNode Relay  v1.0         ║")
     print("  ╚══════════════════════════════════════╝")
-    print(f"  Listening   : http://{args.host}:{args.port}")
+    print(f"  Listening   : unix:{args.socket_path}")
     print(f"  Storage     : {args.db}")
     print(f"  Zero-Knowledge: relay cannot decrypt stored payloads")
+    print(f"  No public network interface — reachable only via a Tor onion service.")
     print(f"  Press Ctrl+C to stop.\n")
 
     try:
@@ -263,6 +313,10 @@ def main():
     finally:
         server.shutdown()
         db.close()
+        try:
+            os.unlink(args.socket_path)
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":

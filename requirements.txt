@@ -1,0 +1,2 @@
+cryptography>=45.0.0,<50
+PySocks>=1.7.1,<2
