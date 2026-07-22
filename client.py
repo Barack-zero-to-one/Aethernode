@@ -24,6 +24,7 @@ import re
 import socket
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,6 +33,8 @@ import socks  # PySocks — SOCKS5 client used to route all relay traffic throug
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+from protocol import PAD_BUCKETS
 
 # ─── Terminal Colors (ANSI — no external dependencies) ───────────────────────
 GREEN  = "\033[92m"
@@ -121,8 +124,11 @@ def pubkey_address(pubkey_b64: str) -> str:
 # AES-GCM encryption, so ciphertext length alone can't be used to distinguish
 # message types (e.g. a one-byte read receipt vs. a multi-KB document) from
 # observed traffic — neither by the relay nor by a network observer.
+#
+# PAD_BUCKETS lives in protocol.py, shared with relay.py, so the relay's POST
+# body-size cap can never silently fall out of sync with this file's padding
+# scheme.
 
-PAD_BUCKETS = (4 * 1024, 16 * 1024, 64 * 1024)  # 4 KB / 16 KB / 64 KB
 _LEN_PREFIX_SIZE = 4  # bytes; big-endian uint32 original-length prefix
 
 
@@ -290,6 +296,23 @@ SOCKS_HOST = DEFAULT_SOCKS_HOST
 SOCKS_PORT = DEFAULT_SOCKS_PORT
 
 
+def _env_int(name: str, default: int) -> int:
+    """
+    Parse an integer environment variable, exiting with a clean CLI error on
+    a bad value instead of letting a stray/mistyped env var crash argument
+    parsing with a raw traceback — even for subcommands like `register` that
+    don't use SOCKS/Tor at all.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        print(f"\n  {RED}{BOLD}✗ Invalid {name}={raw!r} — must be an integer.{RESET}\n")
+        sys.exit(1)
+
+
 def normalize_relay_url(raw: str) -> str:
     """
     Validate that `raw` names a Tor v3 .onion address and return a normalized
@@ -342,6 +365,21 @@ def _require_onion_relay(raw: str) -> str:
         sys.exit(1)
 
 
+def _assert_onion_host(url: str) -> None:
+    """
+    Defense-in-depth re-check of the .onion-only invariant, run again here at
+    the actual network-call boundary. The CLI entry point already validates
+    the relay address via _require_onion_relay before this is ever reached
+    through main(), but _http_post/_http_get are ordinary importable
+    functions — any caller that reaches them without going through main()
+    (a test harness, a future library/GUI wrapper) must not be able to make
+    this module send a request anywhere but a Tor v3 hidden service.
+    """
+    host = urllib.parse.urlsplit(url).hostname or ""
+    if not _ONION_V3_RE.match(host.lower()):
+        raise ValueError(f"refusing to contact a non-.onion host: {host!r}")
+
+
 class _SocksHTTPConnection(http.client.HTTPConnection):
     """
     HTTPConnection that tunnels through a local Tor SOCKS5 proxy.
@@ -384,6 +422,10 @@ def _get_opener():
 
 def _http_post(url: str, body: dict) -> dict:
     """POST JSON to relay over Tor. Raises ConnectionError with a human-readable message."""
+    try:
+        _assert_onion_host(url)
+    except ValueError as exc:
+        raise ConnectionError(str(exc)) from exc
     data = json.dumps(body).encode()
     req  = urllib.request.Request(
         url,
@@ -414,6 +456,10 @@ def _http_post(url: str, body: dict) -> dict:
 
 def _http_get(url: str) -> dict:
     """GET JSON from relay over Tor. Raises ConnectionError with a human-readable message."""
+    try:
+        _assert_onion_host(url)
+    except ValueError as exc:
+        raise ConnectionError(str(exc)) from exc
     req = urllib.request.Request(url, headers={"User-Agent": "AetherNode/1.0"})
     try:
         with _get_opener().open(req, timeout=_HTTP_TIMEOUT) as resp:
@@ -589,7 +635,7 @@ examples:
         "--socks-host", default=os.environ.get("AETHER_SOCKS_HOST", DEFAULT_SOCKS_HOST),
         help=f"Tor SOCKS5 proxy host (default: {DEFAULT_SOCKS_HOST}, or $AETHER_SOCKS_HOST)")
     _socks_parent.add_argument(
-        "--socks-port", type=int, default=int(os.environ.get("AETHER_SOCKS_PORT", DEFAULT_SOCKS_PORT)),
+        "--socks-port", type=int, default=_env_int("AETHER_SOCKS_PORT", DEFAULT_SOCKS_PORT),
         help=f"Tor SOCKS5 proxy port (default: {DEFAULT_SOCKS_PORT}, or $AETHER_SOCKS_PORT)")
 
     p_send = sub.add_parser("send", parents=[_socks_parent], help="Encrypt, sign, and broadcast a message")
