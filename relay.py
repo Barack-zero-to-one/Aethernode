@@ -34,6 +34,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
 import gossip
+import ratelimit
 from protocol import MAX_PUBLISH_BODY_BYTES
 
 # Maximum bytes accepted from a single POST body — guards against memory
@@ -282,9 +283,34 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(400, {"error": f"Invalid JSON: {exc}"})
             return
 
+        # Cheap, indexed short-circuit: skip signature verification and
+        # rate-limit budget entirely for a message that was always going
+        # to be rejected by insert_message_and_maybe_gossip's own
+        # UNIQUE-constraint dedup anyway (a re-submitted or replayed publish).
+        signature = payload.get("signature")
+        if isinstance(signature, str) and gossip.message_exists(self.server.db, DB_LOCK, signature):
+            self._send_json(409, {"error": "Message already published (duplicate signature)"})
+            return
+
+        # Global check first, before the expensive signature verification
+        # below — an identity-independent flood of garbage is rejected at
+        # the cheapest possible point. sender_pubkey is free for anyone to
+        # mint, so it must NOT gate a per-identity check until it's been
+        # proven genuine by that same verification (checking it earlier
+        # would let an attacker grief a specific victim's fairness quota by
+        # spoofing their pubkey in unsigned garbage, at zero cost).
+        if not self.server.client_publish_limiter.check_global():
+            self._send_json(429, {"error": "rate limit exceeded"})
+            return
+
         error = _validate_publish_payload(payload)
         if error:
             self._send_json(400, {"error": error})
+            return
+
+        if not self.server.client_publish_limiter.check_identity(payload["sender_pubkey"]):
+            self.server.client_publish_limiter.refund_global()
+            self._send_json(429, {"error": "rate limit exceeded"})
             return
 
         received_at = datetime.now(timezone.utc).isoformat()
@@ -380,6 +406,26 @@ def main():
                              "defeats AetherNode's no-public-IP guarantee. Requires "
                              f"${gossip.DIRECT_TRANSPORT_ENV_VAR}=1 to also be set, or the "
                              "relay refuses to start.")
+    parser.add_argument("--publish-rate-limit", type=float, default=60,
+                        help="Global /publish messages per minute, across all senders combined "
+                             "— the Sybil-resistant backstop (default: 60).")
+    parser.add_argument("--publish-rate-limit-per-sender", type=float, default=10,
+                        help="Per-sender_pubkey /publish messages per minute — fairness only, "
+                             "not by itself Sybil-resistant (default: 10).")
+    parser.add_argument("--gossip-push-rate-limit", type=float, default=180,
+                        help="Global /gossip/publish messages per minute, across all peers "
+                             "combined (default: 180).")
+    parser.add_argument("--gossip-push-rate-limit-per-peer", type=float, default=60,
+                        help="Per-peer /gossip/publish messages per minute (default: 60).")
+    parser.add_argument("--gossip-pull-rate-limit", type=float, default=3000,
+                        help="Global anti-entropy pull-acceptance messages per minute, across "
+                             "all peers combined — sized well above a single batch so several "
+                             "peers' legitimate catch-up bursts can proceed concurrently "
+                             "(default: 3000).")
+    parser.add_argument("--gossip-pull-rate-limit-per-peer", type=float, default=500,
+                        help="Per-peer anti-entropy pull-acceptance messages per minute — "
+                             "matches the anti-entropy page size (500) so one full legitimate "
+                             "catch-up page always fits in a fresh bucket (default: 500).")
     args = parser.parse_args()
 
     if args.socket_path == args.gossip_socket_path:
@@ -425,12 +471,39 @@ def main():
             direct_transport_unlocked=direct_transport_unlocked,
             max_body_bytes=_MAX_BODY_BYTES,
         )
+
+        # Kept fully independent (no shared global bucket) rather than one
+        # unified pool: push and pull are legitimately different traffic
+        # shapes (push arrives one message at a time; pull is explicitly
+        # designed to return up to GOSSIP_PULL_BATCH_LIMIT=500 in a single
+        # burst), so each needs its own appropriately-sized backstop rather
+        # than a single budget sized for the union of both patterns.
+        client_publish_limiter = ratelimit.RateLimiter(
+            global_capacity=args.publish_rate_limit,
+            global_refill_per_second=ratelimit.per_minute(args.publish_rate_limit),
+            per_identity_capacity=args.publish_rate_limit_per_sender,
+            per_identity_refill_per_second=ratelimit.per_minute(args.publish_rate_limit_per_sender),
+        )
+        gossip_push_limiter = ratelimit.RateLimiter(
+            global_capacity=args.gossip_push_rate_limit,
+            global_refill_per_second=ratelimit.per_minute(args.gossip_push_rate_limit),
+            per_identity_capacity=args.gossip_push_rate_limit_per_peer,
+            per_identity_refill_per_second=ratelimit.per_minute(args.gossip_push_rate_limit_per_peer),
+        )
+        gossip_pull_limiter = ratelimit.RateLimiter(
+            global_capacity=args.gossip_pull_rate_limit,
+            global_refill_per_second=ratelimit.per_minute(args.gossip_pull_rate_limit),
+            per_identity_capacity=args.gossip_pull_rate_limit_per_peer,
+            per_identity_refill_per_second=ratelimit.per_minute(args.gossip_pull_rate_limit_per_peer),
+        )
+
         anti_entropy = gossip.AntiEntropySync(
             db=db, db_lock=DB_LOCK, trust_store=trust_store,
             validate_publish=_validate_publish_payload, gossip_ctx=gossip_ctx,
             own_cert_path=own_cert_path, own_key_path=own_key_path,
             direct_transport_unlocked=direct_transport_unlocked,
             max_body_bytes=_MAX_BODY_BYTES,
+            gossip_pull_limiter=gossip_pull_limiter,
             interval_s=args.gossip_anti_entropy_interval,
         )
 
@@ -438,6 +511,7 @@ def main():
         os.chmod(args.socket_path, 0o660)  # local-only; group access needed by the Tor process — see README
         server.db = db
         server.gossip_ctx = gossip_ctx
+        server.client_publish_limiter = client_publish_limiter
 
         server_ssl_ctx = gossip.build_server_ssl_context(own_cert_path, own_key_path, trust_store)
         gossip_server = gossip.GossipUnixTLSServer(
@@ -449,6 +523,7 @@ def main():
         gossip_server.gossip_ctx = gossip_ctx
         gossip_server.validate_publish = _validate_publish_payload
         gossip_server.max_body_bytes = _MAX_BODY_BYTES
+        gossip_server.gossip_push_limiter = gossip_push_limiter
 
         gossip_thread = threading.Thread(target=gossip_server.serve_forever, daemon=True, name="gossip-listener")
         gossip_thread.start()
