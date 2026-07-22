@@ -199,6 +199,14 @@ def load_peers(peers_file: Path) -> list[PeerConfig]:
             )
             continue
 
+        if any(p.label == label for p in peers):
+            # Not fatal — internal state (e.g. AntiEntropySync's per-peer
+            # catch-up cursor) is keyed by fingerprint, the value actually
+            # validated as unique above, not by this free-text label. Still
+            # worth surfacing: a duplicate label is almost always an
+            # operator mistake (copy-paste during cert rotation).
+            print(f"  WARNING: peer label '{label}' is used by more than one peers.json entry.", file=sys.stderr)
+
         peers.append(PeerConfig(
             label=label,
             transport=entry.get("transport", "tor"),
@@ -238,9 +246,27 @@ class TrustStore:
         return fingerprint in load_blacklist(self._blacklist_file)
 
     def trusted_cadata(self) -> str:
-        """Concatenated PEM text of every currently-active peer's cert, for use as
-        an ssl.SSLContext trust bundle (self-signed certs pinned as trust anchors)."""
-        return "\n".join(p.cert_pem_text for p in self.active_peers())
+        """
+        Concatenated PEM text of every statically configured peer's cert
+        (peers.json), for use as an ssl.SSLContext trust bundle (self-signed
+        certs pinned as trust anchors) — deliberately NOT filtered by
+        blacklist status.
+
+        The TLS handshake and the blacklist check are two separate
+        questions and must stay that way: this bundle answers "is this a
+        peer I've ever configured" (static; changing it requires a
+        restart, same as adding a peer does), while GossipUnixTLSServer.
+        finish_request()'s post-handshake is_blacklisted() check — already
+        hot-reloaded — answers "is this specific peer currently allowed."
+        Filtering the bundle itself by blacklist status would make that
+        second question unrecoverable without a restart: a peer blacklisted
+        at boot would be permanently excluded from the trust anchors, so
+        un-blacklisting it later could never let it complete a handshake
+        again. Keeping the bundle static and doing the only dynamic check
+        in one place (post-handshake) makes revocation AND restoration both
+        take effect immediately, symmetrically.
+        """
+        return "\n".join(p.cert_pem_text for p in self._peers)
 
 
 # ─── TLS Contexts (mutual authentication, no CA — pinning by cert identity) ────
@@ -354,20 +380,32 @@ class GossipUnixTLSServer(socketserver.ThreadingMixIn, HTTPServer):
                 pass
             return
 
-        der = tls_request.getpeercert(binary_form=True)
-        fingerprint = relay_fingerprint_from_der(der) if der else None
+        # ssl.SSLContext.wrap_socket() detach()es the raw socket's file
+        # descriptor and transfers ownership to tls_request. The framework's
+        # own post-finish_request cleanup (ThreadingMixIn.process_request_
+        # thread's `finally: self.shutdown_request(request)`) still operates
+        # on the original, now-detached `request` object — closing an
+        # already-detached socket is a no-op — and BaseHTTPRequestHandler.
+        # finish() only closes its buffered rfile/wfile wrappers, never the
+        # underlying connection object itself. Nothing else in this call
+        # chain ever closes the real fd, so it must be done explicitly here.
+        try:
+            der = tls_request.getpeercert(binary_form=True)
+            fingerprint = relay_fingerprint_from_der(der) if der else None
 
-        # Handshake-time trust (the cadata bundle) already excludes blacklisted
-        # fingerprints. This is a hot-reload freshness re-check: blacklist.json
-        # may have changed since the bundle was built at startup.
-        if fingerprint is None or self.trust_store.is_blacklisted(fingerprint):
+            # Handshake-time trust (the cadata bundle) already excludes
+            # blacklisted fingerprints. This is a hot-reload freshness
+            # re-check: blacklist.json may have changed since the bundle
+            # was built at startup.
+            if fingerprint is None or self.trust_store.is_blacklisted(fingerprint):
+                return
+
+            self.RequestHandlerClass(tls_request, client_address, self)
+        finally:
             try:
                 tls_request.close()
             except OSError:
                 pass
-            return
-
-        self.RequestHandlerClass(tls_request, client_address, self)
 
 
 class GossipHandler(BaseHTTPRequestHandler):
@@ -498,7 +536,16 @@ def insert_message_and_maybe_gossip(
 
     row_id = cur.lastrowid
     if gossip_ctx is not None:
-        gossip_ctx.schedule_fanout(payload)
+        # Fan-out is fire-and-forget by design and must never be allowed to
+        # affect the response to a write that has already succeeded — e.g.
+        # if blacklist.json is transiently malformed mid-edit,
+        # schedule_fanout()'s blacklist read would otherwise raise here,
+        # after the commit, and take the caller's HTTP response down with
+        # it even though the message is already durably stored.
+        try:
+            gossip_ctx.schedule_fanout(payload)
+        except Exception as exc:
+            print(f"  [gossip] failed to schedule fan-out for message {row_id}: {exc}", file=sys.stderr)
     return True, row_id
 
 
@@ -515,8 +562,15 @@ class _UnixHTTPSConnection(http.client.HTTPConnection):
     def connect(self):
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(self.timeout)
-        sock.connect(self._unix_socket_path)
-        self.sock = self._ssl_context.wrap_socket(sock)
+        try:
+            sock.connect(self._unix_socket_path)
+            self.sock = self._ssl_context.wrap_socket(sock)
+        except Exception:
+            # wrap_socket() only takes ownership of sock's fd on success
+            # (via detach()); on failure (handshake rejected, protocol
+            # mismatch) the raw socket is still ours to close.
+            sock.close()
+            raise
 
 
 class _TorHTTPSConnection(http.client.HTTPConnection):
@@ -537,8 +591,12 @@ class _TorHTTPSConnection(http.client.HTTPConnection):
         sock = socks.socksocket()
         sock.set_proxy(socks.SOCKS5, DEFAULT_SOCKS_HOST, DEFAULT_SOCKS_PORT, rdns=True)
         sock.settimeout(self.timeout)
-        sock.connect((self.host, self.port))
-        self.sock = self._ssl_context.wrap_socket(sock)
+        try:
+            sock.connect((self.host, self.port))
+            self.sock = self._ssl_context.wrap_socket(sock)
+        except Exception:
+            sock.close()
+            raise
 
 
 def _open_connection(peer: PeerConfig, ssl_ctx: ssl.SSLContext) -> http.client.HTTPConnection:
@@ -564,22 +622,44 @@ def _refuse_if_direct_locked(peer: PeerConfig, direct_transport_unlocked: bool) 
     return False
 
 
-def _push_to_peer(peer: PeerConfig, payload: dict, own_cert_path: Path, own_key_path: Path,
-                   direct_transport_unlocked: bool) -> None:
+def _read_bounded_response(resp: http.client.HTTPResponse, max_bytes: int) -> bytes:
+    """
+    Read an outbound gossip response with the same size discipline
+    GossipHandler.do_POST already applies to inbound bodies — a peer holding
+    a validly pinned mTLS cert says nothing about its disk/memory being
+    uncompromised, so an unbounded read of its response is a memory-
+    exhaustion vector on a path the rest of this codebase is careful to
+    close everywhere else. Checks the declared Content-Length first (reject
+    before reading anything), then caps the actual read as a backstop
+    against a peer that lies about or omits it.
+    """
+    content_length = resp.getheader("Content-Length")
+    if content_length is not None and int(content_length) > max_bytes:
+        raise ValueError(f"peer response declares {content_length} bytes, exceeds {max_bytes}")
+    body = resp.read(max_bytes + 1)
+    if len(body) > max_bytes:
+        raise ValueError(f"peer response exceeded {max_bytes} bytes")
+    return body
+
+
+def _push_to_peer(peer: PeerConfig, body: bytes, own_cert_path: Path, own_key_path: Path,
+                   direct_transport_unlocked: bool, max_body_bytes: int) -> None:
     if _refuse_if_direct_locked(peer, direct_transport_unlocked):
         return
+    conn = None
     try:
         ssl_ctx = build_client_ssl_context(own_cert_path, own_key_path, peer)
         conn = _open_connection(peer, ssl_ctx)
-        body = json.dumps(payload).encode()
         conn.request("POST", "/gossip/publish", body=body, headers={"Content-Type": "application/json"})
         resp = conn.getresponse()
-        resp.read()
-        conn.close()
+        _read_bounded_response(resp, max_body_bytes)
     except Exception as exc:
         # An unreachable peer is expected steady state under eventual
         # consistency, not a fatal condition — log and move on.
         print(f"  [gossip] push to peer '{peer.label}' failed: {exc}", file=sys.stderr)
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 class GossipContext:
@@ -588,18 +668,24 @@ class GossipContext:
     on a background thread pool so it never delays the caller."""
 
     def __init__(self, own_cert_path: Path, own_key_path: Path, trust_store: TrustStore,
-                 direct_transport_unlocked: bool, max_workers: int = DEFAULT_FANOUT_WORKERS):
+                 direct_transport_unlocked: bool, max_body_bytes: int,
+                 max_workers: int = DEFAULT_FANOUT_WORKERS):
         self.own_cert_path = own_cert_path
         self.own_key_path = own_key_path
         self.trust_store = trust_store
         self.direct_transport_unlocked = direct_transport_unlocked
+        self.max_body_bytes = max_body_bytes
         self._pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="gossip-fanout")
 
     def schedule_fanout(self, payload: dict) -> None:
+        # Serialized once here rather than once per peer inside _push_to_peer
+        # — in a full mesh this fans out to dozens of worker threads that
+        # would otherwise each re-encode the identical dict.
+        body = json.dumps(payload).encode()
         for peer in self.trust_store.active_peers():
             self._pool.submit(
-                _push_to_peer, peer, payload, self.own_cert_path, self.own_key_path,
-                self.direct_transport_unlocked,
+                _push_to_peer, peer, body, self.own_cert_path, self.own_key_path,
+                self.direct_transport_unlocked, self.max_body_bytes,
             )
 
     def shutdown(self) -> None:
@@ -620,7 +706,8 @@ class AntiEntropySync:
 
     def __init__(self, db: sqlite3.Connection, db_lock: threading.Lock, trust_store: TrustStore,
                  validate_publish, gossip_ctx: GossipContext, own_cert_path: Path, own_key_path: Path,
-                 direct_transport_unlocked: bool, interval_s: int = DEFAULT_ANTI_ENTROPY_INTERVAL):
+                 direct_transport_unlocked: bool, max_body_bytes: int,
+                 interval_s: int = DEFAULT_ANTI_ENTROPY_INTERVAL):
         self.db = db
         self.db_lock = db_lock
         self.trust_store = trust_store
@@ -629,7 +716,12 @@ class AntiEntropySync:
         self.own_cert_path = own_cert_path
         self.own_key_path = own_key_path
         self.direct_transport_unlocked = direct_transport_unlocked
+        self.max_body_bytes = max_body_bytes
         self.interval_s = interval_s
+        # Keyed by peer.fingerprint (the value load_peers() actually
+        # validates as unique), not peer.label — a free-text field two
+        # distinct peers.json entries could share, which would otherwise
+        # make them silently overwrite each other's catch-up cursor.
         self._last_seen_id: dict[str, int] = {}
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, daemon=True, name="gossip-anti-entropy")
@@ -653,25 +745,36 @@ class AntiEntropySync:
         if _refuse_if_direct_locked(peer, self.direct_transport_unlocked):
             return
 
-        since_id = self._last_seen_id.get(peer.label, 0)
-        ssl_ctx = build_client_ssl_context(self.own_cert_path, self.own_key_path, peer)
-        conn = _open_connection(peer, ssl_ctx)
-        conn.request("GET", f"/gossip/messages?since_id={since_id}")
-        resp = conn.getresponse()
-        body = resp.read()
-        conn.close()
-        if resp.status != 200:
-            return
+        since_id = self._last_seen_id.get(peer.fingerprint, 0)
+        conn = None
+        try:
+            ssl_ctx = build_client_ssl_context(self.own_cert_path, self.own_key_path, peer)
+            conn = _open_connection(peer, ssl_ctx)
+            conn.request("GET", f"/gossip/messages?since_id={since_id}")
+            resp = conn.getresponse()
+            body = _read_bounded_response(resp, self.max_body_bytes)
+            if resp.status != 200:
+                return
 
-        data = json.loads(body)
-        max_id = since_id
-        for item in data.get("messages", []):
-            payload = item["payload"]
-            if self.validate_publish(payload) is not None:
-                continue  # malformed/unsigned data from a peer — skip it, don't crash the loop
-            received_at = datetime.now(timezone.utc).isoformat()
-            insert_message_and_maybe_gossip(
-                self.db, self.db_lock, payload, payload["recipient_id"], received_at, self.gossip_ctx,
-            )
-            max_id = max(max_id, item["id"])
-        self._last_seen_id[peer.label] = max_id
+            data = json.loads(body)
+            max_id = since_id
+            for item in data.get("messages", []):
+                # The cursor must advance for every item this peer reports,
+                # whether or not it validates — otherwise a single
+                # unparseable batch (a Byzantine peer, or a future
+                # version-skew mismatch) makes every future round re-request
+                # the exact same since_id and get the exact same stuck page,
+                # forever. "How far I've paged through this peer's log" and
+                # "did I accept this particular item" are separate questions.
+                max_id = max(max_id, item["id"])
+                payload = item["payload"]
+                if self.validate_publish(payload) is not None:
+                    continue  # malformed/unsigned data from a peer — skip it, don't crash the loop
+                received_at = datetime.now(timezone.utc).isoformat()
+                insert_message_and_maybe_gossip(
+                    self.db, self.db_lock, payload, payload["recipient_id"], received_at, self.gossip_ctx,
+                )
+            self._last_seen_id[peer.fingerprint] = max_id
+        finally:
+            if conn is not None:
+                conn.close()
