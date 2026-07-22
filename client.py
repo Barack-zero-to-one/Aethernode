@@ -14,18 +14,17 @@ Commands:
 
 import argparse
 import base64
+import hashlib
 import http.client
 import json
 import os
 import socket
 import sys
 import urllib.error
-import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -102,6 +101,15 @@ def pubkey_to_b64(public_key) -> str:
 def b64_to_pubkey(b64: str):
     """Deserialize base64-encoded DER string back to an RSA public key object."""
     return serialization.load_der_public_key(base64.b64decode(b64))
+
+
+def pubkey_address(pubkey_b64: str) -> str:
+    """
+    Derive a routing address (SHA-256 hex digest of the DER-encoded key) from a
+    base64 public key. The relay indexes and serves messages by this address —
+    it never sees a recipient's raw public key, only a one-way hash of it.
+    """
+    return hashlib.sha256(base64.b64decode(pubkey_b64)).hexdigest()
 
 
 # ─── Hybrid Encryption ────────────────────────────────────────────────────────
@@ -210,7 +218,7 @@ def verify_payload_signature(payload: dict) -> bool:
             hashes.SHA256(),
         )
         return True
-    except (InvalidSignature, Exception):
+    except Exception:
         return False
 
 
@@ -297,13 +305,13 @@ def cmd_send(private_key, relay_url: str, recipient_b64: str, message: str):
     print(f"  {DIM}[2/3] Signing     (RSA-PSS + SHA-256)...{RESET}", end=" ", flush=True)
     sender_b64 = pubkey_to_b64(private_key.public_key())
     payload = {
-        "version":          "1",
-        "sender_pubkey":    sender_b64,
-        "recipient_pubkey": recipient_b64,
-        "encrypted_key":    enc["encrypted_key"],
-        "nonce":            enc["nonce"],
-        "ciphertext":       enc["ciphertext"],
-        "timestamp":        datetime.now(timezone.utc).isoformat(),
+        "version":       "1",
+        "sender_pubkey": sender_b64,
+        "recipient_id":  pubkey_address(recipient_b64),
+        "encrypted_key": enc["encrypted_key"],
+        "nonce":         enc["nonce"],
+        "ciphertext":    enc["ciphertext"],
+        "timestamp":     datetime.now(timezone.utc).isoformat(),
     }
     payload["signature"] = sign_payload(payload, private_key)
     print(f"{GREEN}done{RESET}")
@@ -328,9 +336,9 @@ def cmd_fetch(private_key, relay_url: str):
     print(f"\n{BOLD}{CYAN}  AetherNode — Inbox{RESET}")
     print(f"  {'─' * 50}")
 
-    my_pubkey_b64  = pubkey_to_b64(private_key.public_key())
-    encoded_pubkey = urllib.parse.quote(my_pubkey_b64, safe="")
-    url            = f"{relay_url}/fetch?pubkey={encoded_pubkey}"
+    my_pubkey_b64 = pubkey_to_b64(private_key.public_key())
+    my_address    = pubkey_address(my_pubkey_b64)
+    url           = f"{relay_url}/fetch?id={my_address}"
 
     try:
         result = _http_get(url)

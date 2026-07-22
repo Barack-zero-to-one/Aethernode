@@ -24,16 +24,19 @@ from urllib.parse import urlparse, parse_qs
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
-from cryptography.exceptions import InvalidSignature
 
 # Maximum bytes accepted from a single POST body — guards against memory exhaustion
 _MAX_BODY_BYTES: int = 64 * 1024  # 64 KB; far exceeds any valid AetherNode message
 
 # ─── Required fields every published message must carry ──────────────────────
 REQUIRED_FIELDS = {
-    "version", "sender_pubkey", "recipient_pubkey",
+    "version", "sender_pubkey", "recipient_id",
     "encrypted_key", "nonce", "ciphertext", "timestamp", "signature"
 }
+
+# recipient_id is a SHA-256 hex digest (64 chars); cap generously above that to
+# reject junk without hardcoding a specific hash algorithm into the relay.
+_MAX_RECIPIENT_ID_LEN = 128
 
 # Serialize all SQLite access through one lock (connection is not thread-safe)
 DB_LOCK = threading.Lock()
@@ -46,15 +49,16 @@ def init_db(path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(path, check_same_thread=False)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS messages (
-            id               INTEGER PRIMARY KEY AUTOINCREMENT,
-            recipient_pubkey TEXT NOT NULL,
-            sender_pubkey    TEXT NOT NULL,
-            payload          TEXT NOT NULL,
-            received_at      TEXT NOT NULL
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            recipient_id TEXT NOT NULL,
+            sender_pubkey TEXT NOT NULL,
+            signature    TEXT NOT NULL UNIQUE,
+            payload      TEXT NOT NULL,
+            received_at  TEXT NOT NULL
         )
     """)
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_recipient ON messages(recipient_pubkey)"
+        "CREATE INDEX IF NOT EXISTS idx_recipient ON messages(recipient_id)"
     )
     conn.commit()
     return conn
@@ -91,7 +95,7 @@ def verify_signature(payload: dict) -> bool:
             hashes.SHA256()
         )
         return True
-    except (InvalidSignature, Exception):
+    except Exception:
         return False
 
 
@@ -128,18 +132,18 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
             return
 
         if parsed.path == "/fetch":
-            params    = parse_qs(parsed.query)
-            pubkey_list = params.get("pubkey", [])
-            if not pubkey_list:
-                self._send_json(400, {"error": "Missing 'pubkey' query parameter"})
+            params = parse_qs(parsed.query)
+            id_list = params.get("id", [])
+            if not id_list:
+                self._send_json(400, {"error": "Missing 'id' query parameter"})
                 return
 
-            pubkey = pubkey_list[0]
+            recipient_id = id_list[0]
             with DB_LOCK:
                 rows = self.server.db.execute(
                     "SELECT payload FROM messages "
-                    "WHERE recipient_pubkey = ? ORDER BY id ASC",
-                    (pubkey,)
+                    "WHERE recipient_id = ? ORDER BY id ASC",
+                    (recipient_id,)
                 ).fetchall()
 
             messages = [json.loads(row[0]) for row in rows]
@@ -179,25 +183,36 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(400, {"error": f"Missing fields: {', '.join(sorted(missing))}"})
             return
 
+        recipient_id = payload["recipient_id"]
+        if not isinstance(recipient_id, str) or not (0 < len(recipient_id) <= _MAX_RECIPIENT_ID_LEN):
+            self._send_json(400, {"error": "Invalid 'recipient_id'"})
+            return
+
         # Anti-spam gate: reject structurally invalid / forged submissions
         if not verify_signature(payload):
             self._send_json(400, {"error": "Signature verification failed — message rejected"})
             return
 
         received_at = datetime.now(timezone.utc).isoformat()
-        with DB_LOCK:
-            cur = self.server.db.execute(
-                "INSERT INTO messages "
-                "(recipient_pubkey, sender_pubkey, payload, received_at) "
-                "VALUES (?, ?, ?, ?)",
-                (
-                    payload["recipient_pubkey"],
-                    payload["sender_pubkey"],
-                    json.dumps(payload),
-                    received_at,
+        try:
+            with DB_LOCK:
+                cur = self.server.db.execute(
+                    "INSERT INTO messages "
+                    "(recipient_id, sender_pubkey, signature, payload, received_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (
+                        recipient_id,
+                        payload["sender_pubkey"],
+                        payload["signature"],
+                        json.dumps(payload),
+                        received_at,
+                    )
                 )
-            )
-            self.server.db.commit()
+                self.server.db.commit()
+        except sqlite3.IntegrityError:
+            # Same signature already stored — a replayed or re-submitted message.
+            self._send_json(409, {"error": "Message already published (duplicate signature)"})
+            return
 
         self._send_json(200, {"status": "ok", "id": cur.lastrowid})
 

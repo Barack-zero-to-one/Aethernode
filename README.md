@@ -119,7 +119,8 @@ AETHER_HOME=~/.aether_bob python client.py fetch http://localhost:8888
 | Zero-knowledge relay | Relay stores ciphertext blobs; signature check reveals nothing about content |
 | Integrity of AES plaintext | GCM auth tag detects any ciphertext corruption before decryption |
 | Identity portability | Keypair is a PEM file — back it up, move it, run it on any machine |
-| No metadata leakage | No usernames, emails, or phone numbers — only public key hashes as addresses |
+| No metadata leakage | No usernames, emails, or phone numbers. Recipients are addressed by `SHA-256(recipient_pubkey)` — the relay never receives or stores a recipient's raw public key |
+| Replay/duplicate protection | `signature` is `UNIQUE` in the relay's database; re-submitting a captured payload is rejected with `409` instead of duplicating the message |
 
 ---
 
@@ -128,8 +129,8 @@ AETHER_HOME=~/.aether_bob python client.py fetch http://localhost:8888
 ```
 relay.py      ThreadingHTTPServer  (Python stdlib)
               SQLite storage       (Python stdlib)
-              POST /publish  →  verify RSA-PSS sig → store encrypted blob
-              GET  /fetch    →  return blobs by recipient pubkey
+              POST /publish  →  verify RSA-PSS sig → reject dup signature → store encrypted blob
+              GET  /fetch    →  return blobs by recipient_id (SHA-256 of recipient pubkey)
 
 client.py     RSA-2048 keypair     (cryptography)
               AES-256-GCM encrypt  (cryptography — AESGCM)
@@ -152,3 +153,5 @@ Everything else — HTTP server, SQLite, JSON, base64, sockets — is Python sta
 ---
 
 *AetherNode is a protocol reference implementation. For production: add TLS on the relay, relay-to-relay gossip for redundancy, and message TTL / expiry policies.*
+
+> **Note:** the wire protocol changed the recipient field from a raw public key to a `recipient_id` hash, and the relay schema now enforces unique signatures. Delete any pre-existing `aether.db` before running this version.
