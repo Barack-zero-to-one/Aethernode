@@ -3,3 +3,7 @@ __pycache__/
 aether.db
 *.sock
 *.sock.lock
+aether-relay-identity/
+peers.json
+blacklist.json
+peers/
