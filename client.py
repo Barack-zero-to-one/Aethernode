@@ -12,6 +12,7 @@ Commands:
   register                           — Show your public identity key
   send <relay> <recipient_key> <msg> — Encrypt, sign, and broadcast a message
   fetch <relay>                      — Fetch, verify, and decrypt your inbox
+  delete <relay> <target_signature>  — Send a signed deletion request for one message
 """
 
 import argparse
@@ -26,7 +27,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import socks  # PySocks — SOCKS5 client used to route all relay traffic through Tor
@@ -35,6 +36,12 @@ from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from protocol import PAD_BUCKETS
+
+# Default lifetime of a sent message before the relay purges it, in seconds
+# (7 days). Overridable per-send with --ttl-seconds; the relay independently
+# enforces its own --min-ttl/--max-ttl bounds regardless of what a client
+# requests.
+DEFAULT_TTL_SECONDS = 7 * 24 * 3600
 
 # ─── Terminal Colors (ANSI — no external dependencies) ───────────────────────
 GREEN  = "\033[92m"
@@ -500,7 +507,7 @@ def cmd_register(private_key):
 
 # ─── Command: send ────────────────────────────────────────────────────────────
 
-def cmd_send(private_key, relay_url: str, recipient_b64: str, message: str):
+def cmd_send(private_key, relay_url: str, recipient_b64: str, message: str, ttl_seconds: int = DEFAULT_TTL_SECONDS):
     """Encrypt the message for the recipient, sign it, and POST to the relay."""
     print(f"\n{BOLD}{CYAN}  AetherNode — Sending Message{RESET}")
     print(f"  {'─' * 50}")
@@ -533,6 +540,7 @@ def cmd_send(private_key, relay_url: str, recipient_b64: str, message: str):
         "nonce":         enc["nonce"],
         "ciphertext":    enc["ciphertext"],
         "timestamp":     datetime.now(timezone.utc).isoformat(),
+        "expires_at":    (datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)).isoformat(),
     }
     payload["signature"] = sign_payload(payload, private_key)
     print(f"{GREEN}done{RESET}")
@@ -552,7 +560,7 @@ def cmd_send(private_key, relay_url: str, recipient_b64: str, message: str):
 
 # ─── Command: fetch ───────────────────────────────────────────────────────────
 
-def cmd_fetch(private_key, relay_url: str):
+def cmd_fetch(private_key, relay_url: str, delete_after_read: bool = False):
     """Fetch messages from the relay, verify signatures, and decrypt."""
     print(f"\n{BOLD}{CYAN}  AetherNode — Inbox{RESET}")
     print(f"  {'─' * 50}")
@@ -593,15 +601,74 @@ def cmd_fetch(private_key, relay_url: str):
             continue
 
         # Decrypt using our private key
+        decrypted = False
         try:
             plaintext = decrypt_message(msg, private_key)
             print(f"  {BOLD}Content :{RESET} {plaintext}")
+            decrypted = True
         except Exception as exc:
             print(f"  {RED}✗ Decryption failed (message may not be addressed to you): {exc}{RESET}")
+
+        # A 4th, explicit status line whenever --delete-after-read is set —
+        # a network failure here must never be silent, or the user could be
+        # left believing sanitization happened when it didn't.
+        if delete_after_read and decrypted:
+            target_signature = msg.get("signature", "")
+            try:
+                delete_result = _http_post(f"{relay_url}/delete", _build_delete_payload(private_key, target_signature))
+                if delete_result.get("status") == "deleted":
+                    print(f"  {GREEN}✓ Deleted from relay (propagating across mesh){RESET}")
+                else:
+                    print(f"  {YELLOW}~ Delete not yet confirmed (status: {delete_result.get('status', 'unknown')}){RESET}")
+            except ConnectionError as exc:
+                print(f"  {RED}✗ Delete-after-read failed: {exc}{RESET}")
 
         print(f"  {'─' * 50}")
 
     print()
+
+
+# ─── Command: delete ──────────────────────────────────────────────────────────
+
+def _build_delete_payload(private_key, target_signature: str) -> dict:
+    payload = {
+        "version":          "1",
+        "action":           "delete",
+        "target_signature": target_signature,
+        "recipient_pubkey": pubkey_to_b64(private_key.public_key()),
+        "timestamp":        datetime.now(timezone.utc).isoformat(),
+    }
+    payload["signature"] = sign_payload(payload, private_key)
+    return payload
+
+
+def cmd_delete(private_key, relay_url: str, target_signature: str):
+    """Send a signed, recipient-authorized deletion request for one message."""
+    print(f"\n{BOLD}{CYAN}  AetherNode — Delete Request{RESET}")
+    print(f"  {'─' * 50}")
+
+    payload = _build_delete_payload(private_key, target_signature)
+
+    print(f"  {DIM}Requesting deletion of {target_signature[:24]}...{RESET}", end=" ", flush=True)
+    try:
+        result = _http_post(f"{relay_url}/delete", payload)
+    except ConnectionError as exc:
+        print(f"{RED}failed{RESET}")
+        print(f"\n  {RED}✗ {exc}{RESET}\n")
+        sys.exit(1)
+
+    status = result.get("status")
+    if status == "deleted":
+        print(f"{GREEN}done{RESET}")
+        print(f"\n  {GREEN}{BOLD}✓ Message deleted and propagating across the mesh{RESET}\n")
+    elif status == "delete_requested":
+        print(f"{YELLOW}pending{RESET}")
+        print(f"\n  {YELLOW}{BOLD}~ Delete request recorded — this relay hasn't seen a matching, "
+              f"owned message yet; it will be purged automatically if and when it arrives{RESET}\n")
+    else:
+        print(f"{RED}unexpected{RESET}")
+        print(f"\n  {RED}✗ Unexpected response: {result}{RESET}\n")
+        sys.exit(1)
 
 
 # ─── Entry Point ──────────────────────────────────────────────────────────────
@@ -642,9 +709,21 @@ examples:
     p_send.add_argument("relay",         help="Relay .onion address (e.g. http://<56chars>.onion)")
     p_send.add_argument("recipient_key", help="Recipient's base64 public key")
     p_send.add_argument("message",       help="Plaintext message to send")
+    p_send.add_argument("--ttl-seconds", type=int, default=DEFAULT_TTL_SECONDS,
+                        help=f"Seconds until the relay purges this message (default: "
+                             f"{DEFAULT_TTL_SECONDS}, 7 days). The relay independently enforces "
+                             f"its own min/max bounds regardless of this value.")
 
     p_fetch = sub.add_parser("fetch", parents=[_socks_parent], help="Fetch, verify, and decrypt your inbox")
     p_fetch.add_argument("relay", help="Relay .onion address (e.g. http://<56chars>.onion)")
+    p_fetch.add_argument("--delete-after-read", action="store_true",
+                        help="Send a deletion request for each message immediately after it is "
+                             "successfully verified and decrypted.")
+
+    p_delete = sub.add_parser("delete", parents=[_socks_parent],
+                              help="Send a signed deletion request for one message")
+    p_delete.add_argument("relay",           help="Relay .onion address (e.g. http://<56chars>.onion)")
+    p_delete.add_argument("target_signature", help="The 'signature' field of the message to delete")
 
     args = parser.parse_args()
 
@@ -662,9 +741,11 @@ examples:
     if args.command == "register":
         cmd_register(private_key)
     elif args.command == "send":
-        cmd_send(private_key, _require_onion_relay(args.relay), args.recipient_key, args.message)
+        cmd_send(private_key, _require_onion_relay(args.relay), args.recipient_key, args.message, args.ttl_seconds)
     elif args.command == "fetch":
-        cmd_fetch(private_key, _require_onion_relay(args.relay))
+        cmd_fetch(private_key, _require_onion_relay(args.relay), args.delete_after_read)
+    elif args.command == "delete":
+        cmd_delete(private_key, _require_onion_relay(args.relay), args.target_signature)
 
 
 if __name__ == "__main__":

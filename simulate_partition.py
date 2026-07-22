@@ -33,7 +33,7 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -119,6 +119,7 @@ def _build_signed_payload(sender_priv, recipient_pub_b64: str, message: str) -> 
         "nonce": enc["nonce"],
         "ciphertext": enc["ciphertext"],
         "timestamp": datetime.now(timezone.utc).isoformat(),
+        "expires_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
     }
     payload["signature"] = client.sign_payload(payload, sender_priv)
     return payload

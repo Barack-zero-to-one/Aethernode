@@ -94,13 +94,19 @@ On Windows, replace `AETHER_HOME=~/.aether_bob` with `set AETHER_HOME=%USERPROFI
 |---------|-------------|
 | `python client.py register` | Print your public identity key |
 | `python client.py send <relay.onion> <pubkey> <msg>` | Encrypt, sign, and broadcast a message |
+| `--ttl-seconds` (on `send`) | Seconds until the relay purges this message (default 7 days; see Data Retention) |
 | `python client.py fetch <relay.onion>` | Fetch, verify, and decrypt your inbox |
-| `--socks-host` / `--socks-port` (on `send`/`fetch`) | Tor SOCKS5 proxy to use (default `127.0.0.1:9050`, or `$AETHER_SOCKS_HOST`/`$AETHER_SOCKS_PORT`) |
+| `--delete-after-read` (on `fetch`) | Delete each message from the relay immediately after it is verified and decrypted |
+| `python client.py delete <relay.onion> <signature>` | Send a signed deletion request for one specific message |
+| `--socks-host` / `--socks-port` (on `send`/`fetch`/`delete`) | Tor SOCKS5 proxy to use (default `127.0.0.1:9050`, or `$AETHER_SOCKS_HOST`/`$AETHER_SOCKS_PORT`) |
 | `python relay.py --socket-path ./aether-relay.sock` | Start a relay node (persists to `aether.db`) |
 | `python relay.py --socket-path ./aether-relay.sock --db :memory:` | Ephemeral in-memory relay |
 | `--peers-file` / `--blacklist-file` | Gossip trust configuration (default `./peers.json`, `./blacklist.json`; see Federation) |
 | `--gossip-socket-path` / `--gossip-transport` | Gossip listener socket and outbound transport (default `./aether-relay-gossip.sock`, `tor`; see Federation) |
+| `--min-ttl` / `--max-ttl` / `--cleanup-interval` | TTL bounds enforced on every publish, and the background sweep interval that reaps expired messages (see Data Retention) |
+| `--recipient-quota-max-messages` / `--recipient-quota-max-bytes` | Per-recipient storage ceiling, independent of any sender's rate limit (see Data Retention) |
 | `python simulate_partition.py` | Run the 50-relay partition-resilience simulation (see Federation) |
+| `python stress_test_quota.py` | Flood a relay with junk to validate per-recipient quota enforcement (see Data Retention) |
 | `GET /health` | Relay liveness check |
 
 ---
@@ -130,6 +136,10 @@ AetherNode's resistance to censorship follows from its design rather than from a
 | Peer blacklisting | A relay's blacklist is checked immediately after every gossip handshake, before any request is processed, and is re-read fresh on every connection, so revoking a peer's trust takes effect without restarting the relay |
 | Bounded gossip propagation | The same `UNIQUE` constraint on `signature` that gates client-facing replay protection also gates re-gossip: a relay that already holds a message is a silent no-op on receipt and propagates nothing further, which is what keeps total mesh traffic bounded instead of reflooding indefinitely |
 | Publish rate limiting | A valid signature only proves some keypair signed a message, and keypairs are free to generate, so nothing about signing bounds volume. `/publish` and `/gossip/publish` are each gated by a global token bucket (a Sybil-resistant backstop, since minting new identities doesn't grow it) plus a smaller per-identity bucket (fairness, so one sender or peer can't consume the whole shared budget). Every rejection returns the same generic `429` regardless of which layer tripped, so a response can't be used as an oracle for how close the global budget is to exhausted |
+| Cryptographic TTL enforcement | Every message carries a signed `expires_at` field; the relay independently bounds it with `--min-ttl`/`--max-ttl`, `GET /fetch` filters out anything already past expiry on every request, and a background sweep purges expired rows from disk on `--cleanup-interval` |
+| Per-recipient storage quotas | `--recipient-quota-max-messages`/`--recipient-quota-max-bytes` bound one recipient's inbox independently of the sender-facing rate limiter, so a flood spread across many Sybil senders but addressed to a single victim is still capped; exceeding either returns `429` with a quota-specific error distinct from the rate limiter's |
+| Recipient-authorized secure deletion | A message can only be deleted by a request signed with the private key matching its `recipient_id`; deletion propagates mesh-wide to trusted peers, and a delete that arrives before its target message is held as a pending request and resolved once the message's real, verified recipient is known, so a peer that merely observed a signature in transit cannot delete a message it doesn't own |
+| Forensic-resistant delete (bounded) | `PRAGMA secure_delete` with a truncating journal mode overwrites deleted rows and journal pre-images at the SQLite level, defeating ordinary examination of the database file; this does not defend against SSD wear-leveling, filesystem journaling, swap, snapshot backups, or raw block-device access during an in-flight write |
 
 ---
 
@@ -143,9 +153,17 @@ relay.py      RelayUnixHTTPServer  (Python stdlib), AF_UNIX only, no TCP listene
                                     from ever binding the same socket path.
               SQLite storage       (Python stdlib) — the single source of truth,
                                     shared by the client-facing and gossip listeners
-              POST /publish  →  verify RSA-PSS sig → reject dup signature → store
+              POST /publish  →  verify RSA-PSS sig → reject dup signature →
+                                    enforce TTL bounds + recipient quota → store
                                     encrypted blob → fan out to trusted peers
-              GET  /fetch    →  return blobs by recipient_id (SHA-256 of recipient pubkey)
+              GET  /fetch    →  return unexpired blobs by recipient_id (SHA-256
+                                    of recipient pubkey)
+              POST /delete   →  verify requester's signature → confirm-delete if
+                                    owned, else record a pending request →
+                                    fan out to trusted peers
+              Background cleanup thread — purges expired messages and stale
+                                    deletion_requests rows on --cleanup-interval,
+                                    reclaims freed disk via incremental_vacuum
 
 gossip.py     GossipUnixTLSServer  (Python stdlib + cryptography), a second AF_UNIX
                                     listener, TLS-wrapped for mutual authentication.
@@ -210,6 +228,18 @@ A 50-relay simulation, `simulate_partition.py`, validates the resilience this se
 
 ---
 
+## Data Retention (TTL, Quotas, and Deletion)
+
+Every message a client sends carries a signed expiration timestamp, `expires_at`, chosen by the sender through `--ttl-seconds` on `send` (seven days by default) and covered by the same RSA-PSS signature that protects every other field, so a relay or an on-path party cannot extend a message's lifetime without invalidating its signature. The relay independently enforces its own bounds on that value through `--min-ttl` and `--max-ttl`, rejecting anything that expires sooner than the minimum or later than the maximum regardless of what the client requested, and `GET /fetch` filters out anything already past its expiration on every single request rather than trusting a periodic sweep to have already caught it. That sweep runs anyway, on a background thread governed by `--cleanup-interval`, purging expired rows and reclaiming their disk space so the database does not merely stop returning old messages but actually shrinks over time.
+
+Storage is additionally bounded per recipient rather than only in aggregate, since a flood of messages addressed to one victim is a meaningfully different attack from a flood spread across many recipients, and the existing publish rate limiting protects the relay's overall ingestion rate without protecting any single inbox's capacity. `--recipient-quota-max-messages` and `--recipient-quota-max-bytes` cap how many messages and how many total payload bytes a relay will hold for one `recipient_id` at a time, counting every physically stored row regardless of whether it has expired yet, since counting only unexpired rows would let a sender request the shortest allowed TTL repeatedly and slip past the cap between sweeps while still consuming real disk in the meantime. A publish or gossip push that would exceed either limit is rejected with `429` and a quota-specific error message, distinct from the rate limiter's own `429`, so operators and tooling can tell the two apart; an anti-entropy pull that encounters a full recipient simply skips that one message rather than stalling the whole reconciliation pass, on the reasoning that the recipient can still obtain it from any other relay in the mesh that still has room.
+
+A recipient can also force deletion of a specific message directly, using `python client.py delete <relay.onion> <target_signature>` or the `--delete-after-read` flag on `fetch`, which issues the same request automatically for every message immediately after it is successfully verified and decrypted. The request is signed by the recipient's own private key, proving ownership of the address the message was sent to without revealing anything the relay could not already see, and a relay that confirms a deletion propagates the same request to every peer it trusts, so the message is removed mesh-wide rather than only from the relay that happened to receive the request. Because a delete can arrive at a relay before the message it targets does, given gossip's eventual consistency, a request for a signature the relay does not yet hold is recorded as pending rather than ignored, and is resolved the moment the message actually arrives and its real recipient can be checked against the request's claimed identity; only a match results in the message being discarded, so a relay or peer that merely observed a signature in transit cannot use that alone to delete a message it does not own. Deletion at the SQLite level uses `secure_delete` together with a truncating journal mode, so a deleted row's bytes are overwritten in the database file itself rather than left in a freed-but-unreclaimed page or a recoverable journal pre-image. This protects against ordinary examination of the database file; it does not protect against recovery from SSD wear-leveling or block remapping, filesystem journaling, swap, snapshot-style backups, or an examiner with raw block-device access catching an in-flight write.
+
+`stress_test_quota.py` validates the quota mechanism specifically: it launches a real relay, floods it with ten thousand junk messages split between a deliberately small-quota recipient and an unrestricted one, and confirms the capped recipient is rejected exactly at its limit, the uncapped recipient is unaffected, and the relay stays responsive throughout rather than degrading under the flood. Like `simulate_partition.py`, it requires a Linux, macOS, or WSL host and is run with `python stress_test_quota.py`.
+
+---
+
 ## Deployment (Tor Hidden Service)
 
 `relay.py` never communicates with Tor directly; it does nothing more than bind Unix domain sockets. Tor itself, configured through `torrc`, is responsible for publishing them as a v3 hidden service — one `HiddenServicePort` for the client-facing socket, and a second one, on a different virtual port, for the gossip socket. Both live under the same `.onion` address.
@@ -242,6 +272,6 @@ AetherNode depends on two third-party packages, both listed in `requirements.txt
 
 ---
 
-AetherNode is a reference implementation of the protocol rather than a hardened, production-ready deployment. A production deployment would additionally benefit from a message expiry policy bounding how long a relay retains undelivered messages, and from a retry queue for gossip pushes that fail on the first attempt rather than relying solely on the next anti-entropy pass to recover them.
+AetherNode is a reference implementation of the protocol rather than a hardened, production-ready deployment. A production deployment would additionally benefit from a retry queue for gossip pushes that fail on the first attempt rather than relying solely on the next anti-entropy pass to recover them, and from an anti-entropy backstop for deletion requests themselves, which today propagate mesh-wide only through the same best-effort fan-out as everything else and have no periodic reconciliation pass behind them the way messages do.
 
-This release adds relay-to-relay federation on top of earlier breaking changes: the relay is no longer reachable over plain TCP/IP under any circumstance, message payloads are padded before encryption, and a relay now also binds a second socket for mutually-authenticated gossip with its peers. Anyone upgrading from an earlier version should delete any existing `aether.db`, `aether-relay.sock`, and `aether-relay-gossip.sock`, and reconfigure Tor according to the Deployment section above, before running this version.
+This release adds cryptographic TTL enforcement, per-recipient storage quotas, and recipient-authorized secure deletion on top of earlier breaking changes: the relay is no longer reachable over plain TCP/IP under any circumstance, message payloads are padded before encryption, and a relay binds a second socket for mutually-authenticated gossip with its peers. The `messages` table now has a mandatory `expires_at` column and a new companion `deletion_requests` table, and every published message must carry a signed `expires_at` field, which older, pre-upgrade payloads do not have. Anyone upgrading from an earlier version should delete any existing `aether.db`, `aether-relay.sock`, and `aether-relay-gossip.sock`, and reconfigure Tor according to the Deployment section above, before running this version.
