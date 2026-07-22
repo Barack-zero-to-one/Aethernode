@@ -4,8 +4,16 @@ AetherNode Quota Stress Test
 Validates the per-recipient storage quota's core claims: a relay flooded
 with junk messages addressed to one recipient starts rejecting further
 publishes for THAT recipient with 429 once its cap is hit, a DIFFERENT
-recipient (still under quota) is unaffected, and the relay stays responsive
-throughout rather than degrading or crashing under the flood.
+recipient's independent quota is unaffected by the first one being full,
+and the relay stays responsive throughout rather than degrading or
+crashing under the flood.
+
+--recipient-quota-max-messages is a single relay-wide setting applied
+identically to every recipient_id (there is no per-recipient override in
+this system) -- so BOTH identities below hit the SAME cap. The property
+under test is ISOLATION, not "one capped, one unlimited": recipient A's
+inbox being full must never consume or block recipient B's own,
+independent room under that same shared ceiling.
 
 Launches one real relay.py subprocess with a deliberately small quota
 (--recipient-quota-max-messages) and generous rate limits (so rate-limit
@@ -18,9 +26,9 @@ binding and process-locking are not available on native Windows. Run with:
 
     python stress_test_quota.py
 
-Exits 0 if the quota was enforced correctly (capped recipient rejected past
-its limit, uncapped recipient unaffected, relay stayed responsive), 1
-otherwise.
+Exits 0 if the quota was enforced correctly (both recipients independently
+capped at the same relay-wide limit with zero cross-interference, relay
+stayed responsive throughout), 1 otherwise.
 """
 
 import http.client
@@ -136,34 +144,41 @@ def main() -> int:
             return 1
         print("Relay is up.")
 
-        sender_priv = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-        capped_priv = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-        other_priv  = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-        capped_pub_b64 = client.pubkey_to_b64(capped_priv.public_key())
-        other_pub_b64  = client.pubkey_to_b64(other_priv.public_key())
+        sender_priv    = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        recipient_a_priv = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        recipient_b_priv = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        recipient_a_pub_b64 = client.pubkey_to_b64(recipient_a_priv.public_key())
+        recipient_b_pub_b64 = client.pubkey_to_b64(recipient_b_priv.public_key())
 
-        accepted = 0
-        quota_rejected = 0
+        # Tracked PER RECIPIENT, not combined — the property under test is
+        # that each recipient's cap is enforced independently of the
+        # other's, which a combined counter can't distinguish from one
+        # recipient silently starving the other.
+        stats = {
+            "a": {"accepted": 0, "quota_rejected": 0, "cap_first_hit_at": None},
+            "b": {"accepted": 0, "quota_rejected": 0, "cap_first_hit_at": None},
+        }
         other_errors = 0
-        cap_first_hit_at = None
 
-        print(f"Posting {NUM_MESSAGES} junk messages, round-robin between a capped recipient "
-              f"(quota={QUOTA_MAX_MESSAGES}) and an uncapped one...")
+        print(f"Posting {NUM_MESSAGES} junk messages, round-robin between two recipients, "
+              f"both subject to the same relay-wide quota={QUOTA_MAX_MESSAGES}...")
         for i in range(NUM_MESSAGES):
-            target_pub_b64 = capped_pub_b64 if i % 2 == 0 else other_pub_b64
+            which = "a" if i % 2 == 0 else "b"
+            target_pub_b64 = recipient_a_pub_b64 if which == "a" else recipient_b_pub_b64
             payload = _build_junk_payload(sender_priv, target_pub_b64, i)
             status, result = _unix_request(str(socket_path), "POST", "/publish", payload)
 
             if status == 200:
-                accepted += 1
+                stats[which]["accepted"] += 1
             elif status == 429 and result.get("error") == "recipient storage quota exceeded":
-                quota_rejected += 1
-                if cap_first_hit_at is None:
-                    cap_first_hit_at = i
+                stats[which]["quota_rejected"] += 1
+                if stats[which]["cap_first_hit_at"] is None:
+                    stats[which]["cap_first_hit_at"] = i
             else:
                 other_errors += 1
                 if other_errors <= 5:
-                    print(f"  unexpected response at message {i}: {status} {result}", file=sys.stderr)
+                    print(f"  unexpected response at message {i} (recipient {which}): {status} {result}",
+                          file=sys.stderr)
 
             if (i + 1) % HEALTH_CHECK_EVERY == 0:
                 try:
@@ -180,8 +195,11 @@ def main() -> int:
                           f"messages — see {log_path}", file=sys.stderr)
                     return 1
 
-        print(f"\nDone: {accepted} accepted, {quota_rejected} quota-rejected, {other_errors} other errors.")
-        print(f"Cap first hit at message index: {cap_first_hit_at}")
+        expected_per_recipient = NUM_MESSAGES // 2
+        for which, label in (("a", "Recipient A"), ("b", "Recipient B")):
+            s = stats[which]
+            print(f"{label}: {s['accepted']} accepted, {s['quota_rejected']} quota-rejected "
+                  f"(cap first hit at message index {s['cap_first_hit_at']})")
 
         # ── Assertions ──
         ok = True
@@ -190,45 +208,52 @@ def main() -> int:
             print(f"FAIL: {other_errors} messages got an unexpected status/error (see log above).", file=sys.stderr)
             ok = False
 
-        if cap_first_hit_at is None:
-            print("FAIL: the capped recipient's quota was never enforced (expected 429s never happened).",
-                  file=sys.stderr)
-            ok = False
+        for which, label, pub_b64 in (("a", "Recipient A", recipient_a_pub_b64),
+                                       ("b", "Recipient B", recipient_b_pub_b64)):
+            s = stats[which]
+            if s["cap_first_hit_at"] is None:
+                print(f"FAIL: {label}'s quota was never enforced (expected 429s never happened).", file=sys.stderr)
+                ok = False
 
-        # The capped recipient should have exactly QUOTA_MAX_MESSAGES stored
-        # (everything past its cap rejected) — verified directly via /fetch
-        # rather than derived from the accepted/rejected counters above.
-        status, fetch_result = _unix_request(
-            str(socket_path), "GET", f"/fetch?id={client.pubkey_address(capped_pub_b64)}"
-        )
-        if status != 200:
-            print(f"FAIL: could not fetch capped recipient's inbox for verification: {status}", file=sys.stderr)
-            ok = False
-        else:
+            # Verified directly via /fetch rather than derived from the
+            # accepted/rejected counters above, so this also exercises the
+            # real read path, not just the write path.
+            status, fetch_result = _unix_request(
+                str(socket_path), "GET", f"/fetch?id={client.pubkey_address(pub_b64)}"
+            )
+            if status != 200:
+                print(f"FAIL: could not fetch {label}'s inbox for verification: {status}", file=sys.stderr)
+                ok = False
+                continue
+
             stored_count = fetch_result.get("count", -1)
             if stored_count != QUOTA_MAX_MESSAGES:
-                print(f"FAIL: capped recipient has {stored_count} stored messages, "
-                      f"expected exactly {QUOTA_MAX_MESSAGES}.", file=sys.stderr)
+                print(f"FAIL: {label} has {stored_count} stored messages, "
+                      f"expected exactly {QUOTA_MAX_MESSAGES} (the shared relay-wide cap).", file=sys.stderr)
                 ok = False
             else:
-                print(f"PASS: capped recipient stored exactly {stored_count} messages (== quota cap).")
+                print(f"PASS: {label} stored exactly {stored_count} messages (== quota cap).")
 
-        status, fetch_result = _unix_request(
-            str(socket_path), "GET", f"/fetch?id={client.pubkey_address(other_pub_b64)}"
-        )
-        if status != 200:
-            print(f"FAIL: could not fetch uncapped recipient's inbox for verification: {status}", file=sys.stderr)
-            ok = False
-        else:
-            stored_count = fetch_result.get("count", -1)
-            expected_other = NUM_MESSAGES // 2
-            if stored_count != expected_other:
-                print(f"FAIL: uncapped recipient has {stored_count} stored messages, "
-                      f"expected {expected_other} (unaffected by the other recipient's quota).", file=sys.stderr)
+            if s["accepted"] != QUOTA_MAX_MESSAGES:
+                print(f"FAIL: {label} had {s['accepted']} publishes accepted, expected exactly "
+                      f"{QUOTA_MAX_MESSAGES}.", file=sys.stderr)
                 ok = False
-            else:
-                print(f"PASS: uncapped recipient stored all {stored_count} of its messages, "
-                      f"unaffected by the capped recipient's quota.")
+            if s["quota_rejected"] != expected_per_recipient - QUOTA_MAX_MESSAGES:
+                print(f"FAIL: {label} had {s['quota_rejected']} quota rejections, expected exactly "
+                      f"{expected_per_recipient - QUOTA_MAX_MESSAGES}.", file=sys.stderr)
+                ok = False
+
+        # The actual isolation property: both recipients independently
+        # reached the SAME shared cap. If one recipient's fullness had
+        # leaked into or blocked the other's accounting, they would not
+        # both land exactly on QUOTA_MAX_MESSAGES.
+        if stats["a"]["accepted"] == QUOTA_MAX_MESSAGES and stats["b"]["accepted"] == QUOTA_MAX_MESSAGES:
+            print("PASS: both recipients independently reached the same relay-wide cap with "
+                  "zero cross-interference.")
+        else:
+            print("FAIL: recipients did not isolate correctly — see per-recipient results above.",
+                  file=sys.stderr)
+            ok = False
 
         h_status, h_result = _unix_request(str(socket_path), "GET", "/health")
         if h_status != 200 or h_result.get("status") != "alive":
