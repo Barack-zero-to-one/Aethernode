@@ -26,7 +26,7 @@ import sqlite3
 import stat
 import sys
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
@@ -46,13 +46,36 @@ _MAX_BODY_BYTES: int = MAX_PUBLISH_BODY_BYTES + MAX_PUBLISH_BODY_BYTES // 2
 
 # ─── Required fields every published message must carry ──────────────────────
 REQUIRED_FIELDS = {
-    "version", "sender_pubkey", "recipient_id",
+    "version", "sender_pubkey", "recipient_id", "expires_at",
     "encrypted_key", "nonce", "ciphertext", "timestamp", "signature"
+}
+
+# ─── Required fields every delete request must carry ──────────────────────────
+DELETE_REQUIRED_FIELDS = {
+    "version", "action", "target_signature", "recipient_pubkey", "timestamp", "signature"
 }
 
 # recipient_id is a SHA-256 hex digest (64 chars); cap generously above that to
 # reject junk without hardcoding a specific hash algorithm into the relay.
 _MAX_RECIPIENT_ID_LEN = 128
+
+# target_signature is a base64-encoded RSA-2048 PSS signature (~344 chars);
+# cap generously above that to reject junk cheaply.
+_MAX_SIGNATURE_LEN = 512
+
+# TTL bounds enforced in _validate_publish_payload. Set once in main() from
+# CLI flags before any request-serving thread starts — read-only thereafter,
+# so no lock is needed around these module globals (mirrors _MAX_BODY_BYTES'
+# already-established "fixed for the process lifetime" pattern, just made
+# CLI-configurable instead of a hardcoded constant).
+DEFAULT_MIN_TTL_SECONDS = 60
+DEFAULT_MAX_TTL_SECONDS = 30 * 24 * 3600
+_MIN_TTL_SECONDS = DEFAULT_MIN_TTL_SECONDS
+_MAX_TTL_SECONDS = DEFAULT_MAX_TTL_SECONDS
+
+DEFAULT_CLEANUP_INTERVAL_SECONDS = 5 * 60
+DEFAULT_RECIPIENT_QUOTA_MAX_MESSAGES = 1000
+DEFAULT_RECIPIENT_QUOTA_MAX_BYTES = 50 * 1024 * 1024
 
 # Serialize all SQLite access through one lock (connection is not thread-safe)
 DB_LOCK = threading.Lock()
@@ -123,8 +146,27 @@ def _prepare_socket_path(path: str) -> None:
 # ─── Database ─────────────────────────────────────────────────────────────────
 
 def init_db(path: str) -> sqlite3.Connection:
-    """Initialize SQLite schema. Pass ':memory:' for an ephemeral relay."""
+    """
+    Initialize SQLite schema. Pass ':memory:' for an ephemeral relay.
+
+    Three PRAGMAs, two independent justifications that must not be conflated:
+    secure_delete + journal_mode=TRUNCATE serve the FORENSIC goal (deleted
+    content is overwritten in the main file, and the rollback journal that
+    would otherwise hold a recoverable pre-image is truncated to zero length
+    at commit instead of merely unlinked) — this project is a single-writer,
+    fully DB_LOCK-serialized relay, so WAL mode's concurrent-reader benefit is
+    moot and TRUNCATE is the right choice, not a compromise. auto_vacuum=
+    INCREMENTAL serves the separate DISK-RECLAIM goal (the file actually
+    shrinks as the periodic cleanup job frees pages) and has nothing to do
+    with forensic recoverability. Honest limitation: this protects against
+    ordinary on-disk-file examination, not SSD wear-leveling/block remapping,
+    OS filesystem journaling, swap, snapshot-style backups, or raw
+    block-device access catching an in-flight transaction.
+    """
     conn = sqlite3.connect(path, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode = TRUNCATE")
+    conn.execute("PRAGMA secure_delete = ON")
+    conn.execute("PRAGMA auto_vacuum = INCREMENTAL")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS messages (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -132,11 +174,27 @@ def init_db(path: str) -> sqlite3.Connection:
             sender_pubkey TEXT NOT NULL,
             signature    TEXT NOT NULL UNIQUE,
             payload      TEXT NOT NULL,
+            expires_at   TEXT NOT NULL,
             received_at  TEXT NOT NULL
         )
     """)
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_recipient ON messages(recipient_id)"
+        "CREATE INDEX IF NOT EXISTS idx_recipient_expires ON messages(recipient_id, expires_at)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_expires_at ON messages(expires_at)"
+    )
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS deletion_requests (
+            target_signature       TEXT PRIMARY KEY,
+            requester_pubkey       TEXT NOT NULL,
+            requester_recipient_id TEXT NOT NULL,
+            confirmed               INTEGER NOT NULL,
+            requested_at            TEXT NOT NULL
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_deletion_requested_at ON deletion_requests(requested_at)"
     )
     conn.commit()
     return conn
@@ -144,17 +202,20 @@ def init_db(path: str) -> sqlite3.Connection:
 
 # ─── Signature Verification ───────────────────────────────────────────────────
 
-def verify_signature(payload: dict) -> bool:
+def verify_signature(payload: dict, pubkey_field: str = "sender_pubkey") -> bool:
     """
     Verify the RSA-PSS signature embedded in the payload.
 
     This is zero-knowledge: we only check that the signature is valid for the
     embedded public key. We never attempt decryption and learn nothing about
-    message content. Used as an anti-spam gate on /publish.
+    message content. Used as an anti-spam gate on /publish, and (with
+    pubkey_field="recipient_pubkey") on /delete — the field name differs
+    because a delete request is signed by the recipient proving ownership of
+    an address, not by a sender proving authorship of a message.
     """
     try:
         signature  = base64.b64decode(payload["signature"])
-        pub_der    = base64.b64decode(payload["sender_pubkey"])
+        pub_der    = base64.b64decode(payload[pubkey_field])
         public_key = serialization.load_der_public_key(pub_der)
 
         # Canonical form: all fields except 'signature', sorted keys, no spaces
@@ -193,8 +254,61 @@ def _validate_publish_payload(payload: dict) -> str | None:
     if not isinstance(recipient_id, str) or not (0 < len(recipient_id) <= _MAX_RECIPIENT_ID_LEN):
         return "Invalid 'recipient_id'"
 
+    expires_at_raw = payload.get("expires_at")
+    if not isinstance(expires_at_raw, str):
+        return "Invalid 'expires_at'"
+    try:
+        expires_at = datetime.fromisoformat(expires_at_raw)
+    except ValueError:
+        return "Invalid 'expires_at': not a valid ISO8601 timestamp"
+    if expires_at.tzinfo is None:
+        return "Invalid 'expires_at': must be timezone-aware"
+    if expires_at.utcoffset() != timedelta(0):
+        # The stored expires_at column is later compared via plain SQL
+        # string ordering against a UTC isoformat() "now" (see /fetch's
+        # query and _CleanupJob) — ISO8601 string comparison is only
+        # guaranteed monotonic when every compared string uses the same,
+        # zero, UTC offset. A non-UTC offset (e.g. "+05:00") can parse to a
+        # valid, in-bounds instant here while sorting incorrectly against a
+        # UTC "now" string later, letting a message silently outlive its
+        # real expiry by up to the offset's magnitude.
+        return "Invalid 'expires_at': must use a UTC offset ('+00:00' or 'Z')"
+
+    now = datetime.now(timezone.utc)
+    if expires_at < now + timedelta(seconds=_MIN_TTL_SECONDS):
+        return f"'expires_at' must be at least {_MIN_TTL_SECONDS}s in the future"
+    if expires_at > now + timedelta(seconds=_MAX_TTL_SECONDS):
+        return f"'expires_at' must not exceed {_MAX_TTL_SECONDS}s in the future"
+
     if not verify_signature(payload):
         return "Signature verification failed — message rejected"
+
+    return None
+
+
+def _validate_delete_payload(payload: dict) -> str | None:
+    """
+    Shared shape/signature validation for a delete request, mirroring
+    _validate_publish_payload's role: used by both this relay's client-facing
+    /delete handler and gossip.py's peer-facing /gossip/delete handler.
+    Returns None if the payload passes, or an error string describing why it
+    doesn't. Does NOT perform the authorization check (does the requester
+    actually own the target message) — that requires a database lookup and
+    lives in gossip.handle_delete_request instead.
+    """
+    missing = DELETE_REQUIRED_FIELDS - set(payload.keys())
+    if missing:
+        return f"Missing fields: {', '.join(sorted(missing))}"
+
+    if payload.get("action") != "delete":
+        return "Invalid 'action'"
+
+    target_signature = payload.get("target_signature")
+    if not isinstance(target_signature, str) or not (0 < len(target_signature) <= _MAX_SIGNATURE_LEN):
+        return "Invalid 'target_signature'"
+
+    if not verify_signature(payload, pubkey_field="recipient_pubkey"):
+        return "Signature verification failed — delete request rejected"
 
     return None
 
@@ -244,11 +358,12 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
                 return
 
             recipient_id = id_list[0]
+            now = datetime.now(timezone.utc).isoformat()
             with DB_LOCK:
                 rows = self.server.db.execute(
                     "SELECT payload FROM messages "
-                    "WHERE recipient_id = ? ORDER BY id ASC",
-                    (recipient_id,)
+                    "WHERE recipient_id = ? AND expires_at > ? ORDER BY id ASC",
+                    (recipient_id, now)
                 ).fetchall()
 
             messages = [json.loads(row[0]) for row in rows]
@@ -260,10 +375,14 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
     # ── POST ──────────────────────────────────────────────────────────────────
 
     def do_POST(self):
-        if self.path != "/publish":
+        if self.path == "/publish":
+            self._do_publish()
+        elif self.path == "/delete":
+            self._do_delete()
+        else:
             self._send_json(404, {"error": "Not found"})
-            return
 
+    def _do_publish(self):
         try:
             content_length = int(self.headers.get("Content-Length", 0))
         except ValueError:
@@ -292,15 +411,34 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(409, {"error": "Message already published (duplicate signature)"})
             return
 
-        # Global check first, before the expensive signature verification
-        # below — an identity-independent flood of garbage is rejected at
-        # the cheapest possible point. sender_pubkey is free for anyone to
-        # mint, so it must NOT gate a per-identity check until it's been
-        # proven genuine by that same verification (checking it earlier
-        # would let an attacker grief a specific victim's fairness quota by
-        # spoofing their pubkey in unsigned garbage, at zero cost).
+        # Global check next, before ANY database work — an identity-
+        # independent flood of garbage is rejected at the cheapest possible
+        # point (pure in-memory token-bucket arithmetic, no DB_LOCK
+        # acquisition at all). This must run before the quota check below:
+        # unlike message_exists (which only ever helps with an EXACT
+        # duplicate resubmission), a distinct-signature flood can hit
+        # check_recipient_quota at whatever rate an attacker chooses, so
+        # placing it before this cheap, lock-free gate would let a quota-
+        # exhausted-recipient flood force unlimited DB_LOCK-serialized
+        # queries with no throttling at all.
         if not self.server.client_publish_limiter.check_global():
             self._send_json(429, {"error": "rate limit exceeded"})
+            return
+
+        # Per-recipient storage quota — cheap (indexed COUNT/SUM queries)
+        # relative to the signature verification below, and, like
+        # message_exists above, uses the raw, not-yet-verified recipient_id:
+        # the relay never verifies ownership of a recipient_id regardless of
+        # validation status, so checking it this early introduces no new
+        # spoofing concern. This is a non-atomic pre-filter only — the
+        # authoritative, race-free check happens inside
+        # insert_message_and_maybe_gossip, atomically with the insert.
+        recipient_id_raw = payload.get("recipient_id")
+        if isinstance(recipient_id_raw, str) and not gossip.check_recipient_quota(
+            self.server.db, DB_LOCK, recipient_id_raw,
+            self.server.recipient_quota_max_messages, self.server.recipient_quota_max_bytes,
+        ):
+            self._send_json(429, {"error": "recipient storage quota exceeded"})
             return
 
         error = _validate_publish_payload(payload)
@@ -313,15 +451,74 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(429, {"error": "rate limit exceeded"})
             return
 
+        # Last gate before insert, now that the signature (and therefore
+        # recipient_id) is verified genuine: was this exact signature
+        # already the target of a confirmed or pending delete? See
+        # gossip.resolve_deletion_request for why this must run AFTER
+        # signature verification, not before.
+        if gossip.resolve_deletion_request(self.server.db, DB_LOCK, payload["signature"], payload["recipient_id"]):
+            self._send_json(200, {"status": "discarded", "reason": "message was the target of a prior deletion request"})
+            return
+
         received_at = datetime.now(timezone.utc).isoformat()
-        is_new, row_id = gossip.insert_message_and_maybe_gossip(
+        is_new, row_id, quota_exceeded = gossip.insert_message_and_maybe_gossip(
             self.server.db, DB_LOCK, payload, payload["recipient_id"], received_at, self.server.gossip_ctx,
+            self.server.recipient_quota_max_messages, self.server.recipient_quota_max_bytes,
         )
-        if is_new:
+        if quota_exceeded:
+            # Lost a last-moment race against the earlier, non-atomic
+            # pre-filter — this authoritative recheck is what actually
+            # enforces the cap; see insert_message_and_maybe_gossip.
+            self._send_json(429, {"error": "recipient storage quota exceeded"})
+        elif is_new:
             self._send_json(200, {"status": "ok", "id": row_id})
         else:
             # Same signature already stored — a replayed or re-submitted message.
             self._send_json(409, {"error": "Message already published (duplicate signature)"})
+
+    def _do_delete(self):
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            content_length = 0
+        if content_length > _MAX_BODY_BYTES:
+            self._send_json(413, {"error": f"Request body exceeds {_MAX_BODY_BYTES} bytes"})
+            return
+
+        raw = self._read_body(content_length)
+        if not raw:
+            self._send_json(400, {"error": "Empty request body"})
+            return
+
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            self._send_json(400, {"error": f"Invalid JSON: {exc}"})
+            return
+
+        if not self.server.client_publish_limiter.check_global():
+            self._send_json(429, {"error": "rate limit exceeded"})
+            return
+
+        error = _validate_delete_payload(payload)
+        if error:
+            self._send_json(400, {"error": error})
+            return
+
+        recipient_pubkey = payload["recipient_pubkey"]
+        if not self.server.client_publish_limiter.check_identity(recipient_pubkey):
+            self.server.client_publish_limiter.refund_global()
+            self._send_json(429, {"error": "rate limit exceeded"})
+            return
+
+        response, did_confirm = gossip.handle_delete_request(self.server.db, DB_LOCK, payload)
+        self._send_json(200, response)
+
+        if did_confirm and self.server.gossip_ctx is not None:
+            try:
+                self.server.gossip_ctx.schedule_fanout(payload, target_path="/gossip/delete")
+            except Exception as exc:
+                print(f"  [gossip] failed to schedule delete fan-out: {exc}", file=sys.stderr)
 
     def do_OPTIONS(self):
         self.send_response(200)
@@ -365,6 +562,56 @@ class RelayUnixHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
         socketserver.TCPServer.server_bind(self)
         self.server_name = str(self.server_address)  # cosmetic only, unused for routing
         self.server_port = 0
+
+
+# ─── Background Retention Sweep ────────────────────────────────────────────────
+
+class _CleanupJob:
+    """
+    Periodic TTL sweep and tombstone reaping, mirroring gossip.AntiEntropySync's
+    threading.Event-based start/stop pattern. Runs three things every pass,
+    all under db_lock: purge expired messages (the TTL contract), purge
+    deletion_requests rows old enough that no live message could still
+    reference them (requested_at + MAX_TTL is a safe, if slightly
+    conservative, upper bound — a deletion_requests row can only meaningfully
+    apply to a message whose expires_at is at most MAX_TTL after publish, and
+    requested_at is always >= that publish time), and reclaim the freed pages
+    via incremental_vacuum so the file actually shrinks. This last step is
+    the DISK-RECLAIM goal, independent of secure_delete's FORENSIC goal
+    (already achieved the instant each DELETE runs) — see init_db.
+    """
+
+    def __init__(self, db: sqlite3.Connection, db_lock: threading.Lock,
+                 max_ttl_seconds: int, interval_s: int):
+        self.db = db
+        self.db_lock = db_lock
+        self.max_ttl_seconds = max_ttl_seconds
+        self.interval_s = interval_s
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, daemon=True, name="relay-cleanup")
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self._run_once()
+            except Exception as exc:
+                print(f"  [cleanup] sweep failed: {exc}", file=sys.stderr)
+            self._stop.wait(self.interval_s)
+
+    def _run_once(self) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        tombstone_cutoff = (datetime.now(timezone.utc) - timedelta(seconds=self.max_ttl_seconds)).isoformat()
+        with self.db_lock:
+            self.db.execute("DELETE FROM messages WHERE expires_at <= ?", (now,))
+            self.db.execute("DELETE FROM deletion_requests WHERE requested_at <= ?", (tombstone_cutoff,))
+            self.db.commit()
+            self.db.execute("PRAGMA incremental_vacuum")
 
 
 # ─── Entry Point ──────────────────────────────────────────────────────────────
@@ -426,7 +673,27 @@ def main():
                         help="Per-peer anti-entropy pull-acceptance messages per minute — "
                              "matches the anti-entropy page size (500) so one full legitimate "
                              "catch-up page always fits in a fresh bucket (default: 500).")
+    parser.add_argument("--min-ttl", type=int, default=DEFAULT_MIN_TTL_SECONDS,
+                        help="Minimum accepted seconds-until-expiry on a published message's "
+                             f"'expires_at' field (default: {DEFAULT_MIN_TTL_SECONDS}).")
+    parser.add_argument("--max-ttl", type=int, default=DEFAULT_MAX_TTL_SECONDS,
+                        help="Maximum accepted seconds-until-expiry on a published message's "
+                             "'expires_at' field, and the retention window for deletion-request "
+                             f"tombstones (default: {DEFAULT_MAX_TTL_SECONDS}, 30 days).")
+    parser.add_argument("--cleanup-interval", type=int, default=DEFAULT_CLEANUP_INTERVAL_SECONDS,
+                        help="Seconds between background TTL-sweep/tombstone-reap passes "
+                             f"(default: {DEFAULT_CLEANUP_INTERVAL_SECONDS}).")
+    parser.add_argument("--recipient-quota-max-messages", type=int, default=DEFAULT_RECIPIENT_QUOTA_MAX_MESSAGES,
+                        help="Maximum messages physically stored per recipient_id, regardless "
+                             f"of expiry status (default: {DEFAULT_RECIPIENT_QUOTA_MAX_MESSAGES}).")
+    parser.add_argument("--recipient-quota-max-bytes", type=int, default=DEFAULT_RECIPIENT_QUOTA_MAX_BYTES,
+                        help="Maximum total payload bytes physically stored per recipient_id, "
+                             f"regardless of expiry status (default: {DEFAULT_RECIPIENT_QUOTA_MAX_BYTES}, 50 MiB).")
     args = parser.parse_args()
+
+    global _MIN_TTL_SECONDS, _MAX_TTL_SECONDS
+    _MIN_TTL_SECONDS = args.min_ttl
+    _MAX_TTL_SECONDS = args.max_ttl
 
     if args.socket_path == args.gossip_socket_path:
         # _acquire_relay_lock is called once per path below; flock() locks
@@ -447,7 +714,7 @@ def main():
 
     db = None
     server = gossip_server = gossip_thread = None
-    anti_entropy = gossip_ctx = None
+    anti_entropy = gossip_ctx = cleanup_job = None
     server_started = gossip_server_started = False
     try:
         db = init_db(args.db)
@@ -505,6 +772,12 @@ def main():
             max_body_bytes=_MAX_BODY_BYTES,
             gossip_pull_limiter=gossip_pull_limiter,
             interval_s=args.gossip_anti_entropy_interval,
+            recipient_quota_max_messages=args.recipient_quota_max_messages,
+            recipient_quota_max_bytes=args.recipient_quota_max_bytes,
+        )
+
+        cleanup_job = _CleanupJob(
+            db=db, db_lock=DB_LOCK, max_ttl_seconds=args.max_ttl, interval_s=args.cleanup_interval,
         )
 
         server = RelayUnixHTTPServer(args.socket_path, RelayHandler)
@@ -512,6 +785,8 @@ def main():
         server.db = db
         server.gossip_ctx = gossip_ctx
         server.client_publish_limiter = client_publish_limiter
+        server.recipient_quota_max_messages = args.recipient_quota_max_messages
+        server.recipient_quota_max_bytes = args.recipient_quota_max_bytes
 
         server_ssl_ctx = gossip.build_server_ssl_context(own_cert_path, own_key_path, trust_store)
         gossip_server = gossip.GossipUnixTLSServer(
@@ -522,13 +797,17 @@ def main():
         gossip_server.db_lock = DB_LOCK
         gossip_server.gossip_ctx = gossip_ctx
         gossip_server.validate_publish = _validate_publish_payload
+        gossip_server.validate_delete = _validate_delete_payload
         gossip_server.max_body_bytes = _MAX_BODY_BYTES
         gossip_server.gossip_push_limiter = gossip_push_limiter
+        gossip_server.recipient_quota_max_messages = args.recipient_quota_max_messages
+        gossip_server.recipient_quota_max_bytes = args.recipient_quota_max_bytes
 
         gossip_thread = threading.Thread(target=gossip_server.serve_forever, daemon=True, name="gossip-listener")
         gossip_thread.start()
         gossip_server_started = True
         anti_entropy.start()
+        cleanup_job.start()
 
         peer_count = len(trust_store.active_peers())
         print("  ╔══════════════════════════════════════╗")
@@ -539,6 +818,9 @@ def main():
         print(f"  Relay fingerprint : {own_fingerprint}")
         print(f"  Trusted peers     : {peer_count}")
         print(f"  Storage           : {args.db}")
+        print(f"  TTL bounds        : {args.min_ttl}s – {args.max_ttl}s")
+        print(f"  Recipient quota   : {args.recipient_quota_max_messages} messages / "
+              f"{args.recipient_quota_max_bytes} bytes")
         print(f"  Zero-Knowledge: relay cannot decrypt stored payloads")
         print(f"  No public network interface — reachable only via a Tor onion service.")
         print(f"  Press Ctrl+C to stop.\n")
@@ -556,6 +838,11 @@ def main():
         if anti_entropy is not None:
             try:
                 anti_entropy.stop()
+            except Exception:
+                pass
+        if cleanup_job is not None:
+            try:
+                cleanup_job.stop()
             except Exception:
                 pass
         if gossip_ctx is not None:

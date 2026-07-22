@@ -18,6 +18,7 @@ This module is relay-side only. It is imported by relay.py and must never be
 imported by client.py or protocol.py; it must never import relay.py.
 """
 
+import base64
 import hashlib
 import http.client
 import json
@@ -466,10 +467,14 @@ class GossipHandler(BaseHTTPRequestHandler):
         self._send_json(404, {"error": "Not found"})
 
     def do_POST(self):
-        if self.path != "/gossip/publish":
+        if self.path == "/gossip/publish":
+            self._do_publish()
+        elif self.path == "/gossip/delete":
+            self._do_delete()
+        else:
             self._send_json(404, {"error": "Not found"})
-            return
 
+    def _do_publish(self):
         try:
             content_length = int(self.headers.get("Content-Length", 0))
         except ValueError:
@@ -502,10 +507,28 @@ class GossipHandler(BaseHTTPRequestHandler):
         # The connecting peer's mTLS identity is already trustworthy at
         # this point (established by the handshake itself, before any
         # application data was even read), unlike a client's self-declared
-        # sender_pubkey — so global and per-peer budget are checked together.
+        # sender_pubkey — so global and per-peer budget are checked together,
+        # and BEFORE the quota check below: this is pure in-memory token-
+        # bucket arithmetic, cheaper than any DB query, so it must run first
+        # or a distinct-signature flood aimed at a full-quota recipient could
+        # force unlimited DB_LOCK-serialized quota queries with no throttling.
         peer_fingerprint = getattr(self.connection, "peer_fingerprint", None)
         if peer_fingerprint is None or not self.server.gossip_push_limiter.allow(peer_fingerprint):
             self._send_json(429, {"error": "rate limit exceeded"})
+            return
+
+        # Per-recipient storage quota — routing a flood through a compliant
+        # or malicious peer via gossip is just as capable of filling a
+        # target's inbox as publishing directly, so this must be enforced
+        # here too, not only on the client-facing /publish path. Non-atomic
+        # pre-filter only — see insert_message_and_maybe_gossip for the
+        # authoritative, race-free recheck.
+        recipient_id_raw = payload.get("recipient_id")
+        if isinstance(recipient_id_raw, str) and not check_recipient_quota(
+            self.server.db, self.server.db_lock, recipient_id_raw,
+            self.server.recipient_quota_max_messages, self.server.recipient_quota_max_bytes,
+        ):
+            self._send_json(429, {"error": "recipient storage quota exceeded"})
             return
 
         error = self.server.validate_publish(payload)
@@ -513,17 +536,65 @@ class GossipHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": error})
             return
 
+        # Last gate before insert, now that the signature (and therefore
+        # recipient_id) is verified genuine — see resolve_deletion_request.
+        if resolve_deletion_request(self.server.db, self.server.db_lock, payload["signature"], payload["recipient_id"]):
+            self._send_json(200, {"status": "discarded"})
+            return
+
         received_at = datetime.now(timezone.utc).isoformat()
-        is_new, row_id = insert_message_and_maybe_gossip(
+        is_new, row_id, quota_exceeded = insert_message_and_maybe_gossip(
             self.server.db, self.server.db_lock, payload,
             payload["recipient_id"], received_at, self.server.gossip_ctx,
+            self.server.recipient_quota_max_messages, self.server.recipient_quota_max_bytes,
         )
-        if is_new:
+        if quota_exceeded:
+            self._send_json(429, {"error": "recipient storage quota exceeded"})
+        elif is_new:
             self._send_json(200, {"status": "ok", "id": row_id})
         else:
             # Expected steady state as the flood converges across the mesh —
             # not an error the pushing peer should treat as a failure.
             self._send_json(200, {"status": "duplicate"})
+
+    def _do_delete(self):
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            content_length = 0
+        if content_length > self.server.max_body_bytes:
+            self._send_json(413, {"error": f"Request body exceeds {self.server.max_body_bytes} bytes"})
+            return
+
+        raw = self._read_body(content_length)
+        if not raw:
+            self._send_json(400, {"error": "Empty request body"})
+            return
+
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            self._send_json(400, {"error": f"Invalid JSON: {exc}"})
+            return
+
+        peer_fingerprint = getattr(self.connection, "peer_fingerprint", None)
+        if peer_fingerprint is None or not self.server.gossip_push_limiter.allow(peer_fingerprint):
+            self._send_json(429, {"error": "rate limit exceeded"})
+            return
+
+        error = self.server.validate_delete(payload)
+        if error:
+            self._send_json(400, {"error": error})
+            return
+
+        response, did_confirm = handle_delete_request(self.server.db, self.server.db_lock, payload)
+        self._send_json(200, response)
+
+        if did_confirm and self.server.gossip_ctx is not None:
+            try:
+                self.server.gossip_ctx.schedule_fanout(payload, target_path="/gossip/delete")
+            except Exception as exc:
+                print(f"  [gossip] failed to schedule delete fan-out: {exc}", file=sys.stderr)
 
     def do_OPTIONS(self):
         self.send_response(200)
@@ -559,27 +630,59 @@ def insert_message_and_maybe_gossip(
     recipient_id: str,
     received_at: str,
     gossip_ctx: "GossipContext | None",
-) -> tuple[bool, int | None]:
+    quota_max_messages: int | None = None,
+    quota_max_bytes: int | None = None,
+) -> tuple[bool, int | None, bool]:
     """
     The single insert path used by all three ways a relay can learn about a
     message: a client's direct POST /publish, a peer's POST /gossip/publish,
-    and a peer's response to an anti-entropy pull. Returns (is_new, row_id).
+    and a peer's response to an anti-entropy pull. Returns (is_new, row_id,
+    quota_exceeded).
 
     A message this relay already has is a silent no-op (IntegrityError on the
     UNIQUE signature constraint) — no re-gossip. Re-gossip fires only on a
     genuinely new insert, which is what keeps a mesh's total gossip traffic
     bounded instead of reflooding forever.
+
+    When quota_max_messages/quota_max_bytes are given, the quota is
+    re-checked HERE, atomically with the INSERT, under the same db_lock
+    acquisition — this is the AUTHORITATIVE check. check_recipient_quota()
+    is a separate, non-atomic, cheap pre-filter callers run earlier (before
+    the expensive signature verification) purely to reject the common case
+    fast. Without an atomic re-check here, concurrent requests under
+    ThreadingMixIn could all pass that earlier, separately-locked check
+    before any of them inserts, collectively overshooting the cap — the same
+    relationship message_exists() (cheap pre-filter) already has with the
+    UNIQUE constraint below (authoritative).
     """
+    quota_exceeded = False
     try:
         with db_lock:
+            if quota_max_messages is not None:
+                count = db.execute(
+                    "SELECT COUNT(*) FROM messages WHERE recipient_id = ?", (recipient_id,)
+                ).fetchone()[0]
+                if count >= quota_max_messages:
+                    quota_exceeded = True
+                else:
+                    total_bytes = db.execute(
+                        "SELECT COALESCE(SUM(LENGTH(payload)), 0) FROM messages WHERE recipient_id = ?",
+                        (recipient_id,)
+                    ).fetchone()[0]
+                    if total_bytes >= quota_max_bytes:
+                        quota_exceeded = True
+            if quota_exceeded:
+                return False, None, True
+
             cur = db.execute(
-                "INSERT INTO messages (recipient_id, sender_pubkey, signature, payload, received_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (recipient_id, payload["sender_pubkey"], payload["signature"], json.dumps(payload), received_at),
+                "INSERT INTO messages (recipient_id, sender_pubkey, signature, payload, expires_at, received_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (recipient_id, payload["sender_pubkey"], payload["signature"], json.dumps(payload),
+                 payload["expires_at"], received_at),
             )
             db.commit()
     except sqlite3.IntegrityError:
-        return False, None
+        return False, None, False
 
     row_id = cur.lastrowid
     if gossip_ctx is not None:
@@ -593,7 +696,160 @@ def insert_message_and_maybe_gossip(
             gossip_ctx.schedule_fanout(payload)
         except Exception as exc:
             print(f"  [gossip] failed to schedule fan-out for message {row_id}: {exc}", file=sys.stderr)
-    return True, row_id
+    return True, row_id, False
+
+
+def check_recipient_quota(db: sqlite3.Connection, db_lock: threading.Lock, recipient_id: str,
+                            max_messages: int, max_bytes: int) -> bool:
+    """
+    True if `recipient_id` has room for one more message under both the
+    message-count and total-byte ceilings. Deliberately counts every
+    PHYSICALLY STORED row, with no expires_at filter: if quota accounting
+    excluded expired-but-not-yet-swept rows (the natural choice, to stay
+    consistent with what /fetch returns), an attacker could set expires_at
+    to the minimum allowed value and get effectively unlimited inserts
+    accepted against one recipient — each message "expires" and drops out
+    of quota accounting almost immediately while still occupying real disk
+    until the next periodic sweep. Quota tracks what is physically stored;
+    only the periodic cleanup sweep or an explicit delete frees headroom.
+
+    Two short-circuiting queries, not one combined aggregate: COUNT(*) is
+    answerable from idx_recipient_expires without touching the payload
+    column, while SUM(LENGTH(payload)) cannot be — so the cheaper check
+    runs first and skips the more expensive one whenever it already fails.
+    """
+    with db_lock:
+        count = db.execute(
+            "SELECT COUNT(*) FROM messages WHERE recipient_id = ?", (recipient_id,)
+        ).fetchone()[0]
+        if count >= max_messages:
+            return False
+        total_bytes = db.execute(
+            "SELECT COALESCE(SUM(LENGTH(payload)), 0) FROM messages WHERE recipient_id = ?", (recipient_id,)
+        ).fetchone()[0]
+        return total_bytes < max_bytes
+
+
+def pubkey_address(pubkey_b64: str) -> str:
+    """
+    Relay-side twin of client.py's function of the same name (duplicated,
+    not imported — gossip.py must never import client.py). Derives the same
+    routing address a client computes from its own public key, so a delete
+    request's claimed recipient_pubkey can be checked against a stored
+    message's recipient_id.
+    """
+    return hashlib.sha256(base64.b64decode(pubkey_b64)).hexdigest()
+
+
+def resolve_deletion_request(db: sqlite3.Connection, db_lock: threading.Lock,
+                               signature: str, recipient_id: str) -> bool:
+    """
+    Checked as the LAST gate before inserting a genuinely new message —
+    after signature verification, not before. A delete request can outrun
+    the message it targets (arrives at a relay before the message itself,
+    via a different, faster gossip path); if this relay did nothing for an
+    unknown signature, the message would slip in moments later and the
+    delete would be lost forever. handle_delete_request records that as a
+    PENDING deletion_requests row when the target isn't found yet; this
+    function is where that pending request gets resolved once the message
+    actually arrives and its real, cryptographically-verified recipient_id
+    becomes available to check against.
+
+    This MUST run only after the caller has already verified the payload's
+    signature (so `recipient_id` is trustworthy) — running it earlier, on an
+    unverified recipient_id, would let an attacker who merely observed a
+    real (plaintext-visible) signature value forge a bogus message carrying
+    that signature and a recipient_id they choose, tricking this function
+    into confirming a tombstone for a message they don't own. That is
+    exactly the authorization hole the two-phase pending/confirmed design
+    exists to close for handle_delete_request itself; the same care is
+    needed here on the resolution side.
+
+    Returns True if the message must be discarded (already confirmed
+    deleted, or a pending request's claim just matched and was promoted),
+    False if it should proceed to normal insertion (no request exists, or a
+    pending request's claim didn't match and was cleaned up).
+    """
+    with db_lock:
+        row = db.execute(
+            "SELECT confirmed, requester_recipient_id FROM deletion_requests WHERE target_signature = ?",
+            (signature,)
+        ).fetchone()
+        if row is None:
+            return False
+
+        confirmed, requester_recipient_id = row
+        if confirmed:
+            return True
+
+        if requester_recipient_id == recipient_id:
+            db.execute(
+                "UPDATE deletion_requests SET confirmed = 1 WHERE target_signature = ?", (signature,)
+            )
+            db.commit()
+            return True
+
+        db.execute("DELETE FROM deletion_requests WHERE target_signature = ?", (signature,))
+        db.commit()
+        return False
+
+
+def handle_delete_request(db: sqlite3.Connection, db_lock: threading.Lock, payload: dict) -> tuple[dict, bool]:
+    """
+    Processes an already-validated (structural fields + the request's own
+    self-signature) delete request. Used by both this relay's client-facing
+    POST /delete and the peer-facing POST /gossip/delete, which forward the
+    identical payload verbatim (mirroring how /gossip/publish forwards an
+    original client-signed publish unchanged).
+
+    Returns (response_body, did_confirm) — did_confirm tells the caller
+    whether to schedule mesh-wide fan-out of this same request to trusted
+    peers; only a locally-confirmed delete needs to propagate.
+    """
+    target_signature = payload["target_signature"]
+    requester_pubkey = payload["recipient_pubkey"]
+    requester_recipient_id = pubkey_address(requester_pubkey)
+    now = datetime.now(timezone.utc).isoformat()
+
+    with db_lock:
+        row = db.execute(
+            "SELECT recipient_id FROM messages WHERE signature = ?", (target_signature,)
+        ).fetchone()
+
+        if row is not None and row[0] == requester_recipient_id:
+            # Authorized: secure-delete the message (PRAGMA secure_delete +
+            # journal_mode=TRUNCATE, set in init_db, make this an actual
+            # overwrite, not just a freed page), write a confirmed tombstone.
+            db.execute("DELETE FROM messages WHERE signature = ?", (target_signature,))
+            db.execute(
+                "INSERT OR REPLACE INTO deletion_requests "
+                "(target_signature, requester_pubkey, requester_recipient_id, confirmed, requested_at) "
+                "VALUES (?, ?, ?, 1, ?)",
+                (target_signature, requester_pubkey, requester_recipient_id, now),
+            )
+            db.commit()
+            return {"status": "deleted", "propagation": "async"}, True
+
+        # Either not found locally, or found but the requester doesn't own
+        # it: identical, non-committal handling for both — no distinguishable
+        # signal for "exists but isn't yours" vs. "doesn't exist", which
+        # would otherwise be an oracle for probing which signatures belong
+        # to which likely victims.
+        if row is None:
+            # Record a PENDING request (unverified — there's nothing to
+            # check ownership against yet) so a later arrival is still
+            # caught by resolve_deletion_request. INSERT OR IGNORE: a
+            # confirmed or pending row may already exist for this exact
+            # signature (a repeat request, or the echo of this relay's own
+            # earlier fan-out); never downgrade an existing confirmed row.
+            db.execute(
+                "INSERT OR IGNORE INTO deletion_requests "
+                "(target_signature, requester_pubkey, requester_recipient_id, confirmed, requested_at) "
+                "VALUES (?, ?, ?, 0, ?)",
+                (target_signature, requester_pubkey, requester_recipient_id, now),
+            )
+            db.commit()
+        return {"status": "delete_requested"}, False
 
 
 # ─── Outbound Transports (Tor-tunnelled in production, direct for testing) ────
@@ -690,36 +946,38 @@ def _read_bounded_response(resp: http.client.HTTPResponse, max_bytes: int) -> by
 
 
 def _push_to_peer(peer: PeerConfig, body: bytes, own_cert_path: Path, own_key_path: Path,
-                   direct_transport_unlocked: bool, max_body_bytes: int) -> None:
+                   direct_transport_unlocked: bool, max_body_bytes: int,
+                   target_path: str = "/gossip/publish") -> None:
     if _refuse_if_direct_locked(peer, direct_transport_unlocked):
         return
     conn = None
     try:
         ssl_ctx = build_client_ssl_context(own_cert_path, own_key_path, peer)
         conn = _open_connection(peer, ssl_ctx)
-        conn.request("POST", "/gossip/publish", body=body, headers={"Content-Type": "application/json"})
+        conn.request("POST", target_path, body=body, headers={"Content-Type": "application/json"})
         resp = conn.getresponse()
         _read_bounded_response(resp, max_body_bytes)
         if resp.status == 429:
-            # No retry here by design (push is fire-and-forget); the next
-            # anti-entropy round from the peer's own side will naturally
-            # re-offer this message once its rate-limit budget refills,
-            # since a 429'd push was never inserted anywhere. Logged only
-            # for operator visibility into fan-out throttling.
-            print(f"  [gossip] push to peer '{peer.label}' was rate-limited — will be "
-                  f"picked up by anti-entropy instead", file=sys.stderr)
+            # No retry here by design (push is fire-and-forget). For
+            # /gossip/publish, the peer's own next anti-entropy round will
+            # naturally re-offer this message once its rate-limit budget
+            # refills, since a 429'd push was never inserted anywhere;
+            # /gossip/delete has no anti-entropy backstop, so a rate-limited
+            # delete fan-out is simply lost on that one peer — logged either
+            # way for operator visibility into fan-out throttling.
+            print(f"  [gossip] push to peer '{peer.label}' ({target_path}) was rate-limited", file=sys.stderr)
     except Exception as exc:
         # An unreachable peer is expected steady state under eventual
         # consistency, not a fatal condition — log and move on.
-        print(f"  [gossip] push to peer '{peer.label}' failed: {exc}", file=sys.stderr)
+        print(f"  [gossip] push to peer '{peer.label}' ({target_path}) failed: {exc}", file=sys.stderr)
     finally:
         if conn is not None:
             conn.close()
 
 
 class GossipContext:
-    """Async push fan-out: schedules a POST /gossip/publish to every trusted,
-    non-blacklisted peer whenever a genuinely new message is inserted locally,
+    """Async push fan-out: schedules a POST to every trusted, non-blacklisted
+    peer whenever a genuinely new message is inserted (or deleted) locally,
     on a background thread pool so it never delays the caller."""
 
     def __init__(self, own_cert_path: Path, own_key_path: Path, trust_store: TrustStore,
@@ -732,7 +990,7 @@ class GossipContext:
         self.max_body_bytes = max_body_bytes
         self._pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="gossip-fanout")
 
-    def schedule_fanout(self, payload: dict) -> None:
+    def schedule_fanout(self, payload: dict, target_path: str = "/gossip/publish") -> None:
         # Serialized once here rather than once per peer inside _push_to_peer
         # — in a full mesh this fans out to dozens of worker threads that
         # would otherwise each re-encode the identical dict.
@@ -740,7 +998,7 @@ class GossipContext:
         for peer in self.trust_store.active_peers():
             self._pool.submit(
                 _push_to_peer, peer, body, self.own_cert_path, self.own_key_path,
-                self.direct_transport_unlocked, self.max_body_bytes,
+                self.direct_transport_unlocked, self.max_body_bytes, target_path,
             )
 
     def shutdown(self) -> None:
@@ -763,6 +1021,7 @@ class AntiEntropySync:
                  validate_publish, gossip_ctx: GossipContext, own_cert_path: Path, own_key_path: Path,
                  direct_transport_unlocked: bool, max_body_bytes: int,
                  gossip_pull_limiter: "ratelimit.RateLimiter",
+                 recipient_quota_max_messages: int, recipient_quota_max_bytes: int,
                  interval_s: int = DEFAULT_ANTI_ENTROPY_INTERVAL):
         self.db = db
         self.db_lock = db_lock
@@ -774,6 +1033,8 @@ class AntiEntropySync:
         self.direct_transport_unlocked = direct_transport_unlocked
         self.max_body_bytes = max_body_bytes
         self.gossip_pull_limiter = gossip_pull_limiter
+        self.recipient_quota_max_messages = recipient_quota_max_messages
+        self.recipient_quota_max_bytes = recipient_quota_max_bytes
         self.interval_s = interval_s
         # Keyed by peer.fingerprint (the value load_peers() actually
         # validates as unique), not peer.label — a free-text field two
@@ -824,6 +1085,11 @@ class AntiEntropySync:
                     max_id = max(max_id, item["id"])
                     continue
 
+                # Global budget checked before the quota query below — pure
+                # in-memory token-bucket arithmetic, cheaper than any DB
+                # query, so it must run first or a distinct-signature flood
+                # aimed at a full-quota recipient could force unlimited
+                # DB_LOCK-serialized quota queries with no throttling at all.
                 if not self.gossip_pull_limiter.check_global():
                     # Budget exhausted for this round. Unlike a validation
                     # failure below, this is a TEMPORARY condition — the
@@ -833,6 +1099,22 @@ class AntiEntropySync:
                     # instead of silently and permanently losing it the way
                     # advancing past it would.
                     break
+
+                recipient_id_raw = payload.get("recipient_id")
+                if isinstance(recipient_id_raw, str) and not check_recipient_quota(
+                    self.db, self.db_lock, recipient_id_raw,
+                    self.recipient_quota_max_messages, self.recipient_quota_max_bytes,
+                ):
+                    # Quota is a capacity ceiling, not a pacing problem —
+                    # retrying later doesn't inherently create room, unlike
+                    # the rate-limit exhaustion above/below. Treated like a
+                    # validation failure: permanent skip, advance past it.
+                    # The recipient can still obtain this message from any
+                    # other, non-quota-constrained relay in the mesh. Must
+                    # NEVER write to deletion_requests — "this relay happened
+                    # to be full" is not "the recipient deleted this."
+                    max_id = max(max_id, item["id"])
+                    continue
 
                 # The cursor must advance past a PERMANENTLY invalid item
                 # (whether or not it validates), or a single unparseable
@@ -852,10 +1134,22 @@ class AntiEntropySync:
                     break  # per-peer budget exhausted — same temporary treatment as above
 
                 max_id = max(max_id, item["id"])
+
+                # Last gate before insert, now that the signature is
+                # verified genuine — see resolve_deletion_request.
+                if resolve_deletion_request(self.db, self.db_lock, signature, payload["recipient_id"]):
+                    continue
+
                 received_at = datetime.now(timezone.utc).isoformat()
                 insert_message_and_maybe_gossip(
                     self.db, self.db_lock, payload, payload["recipient_id"], received_at, self.gossip_ctx,
+                    self.recipient_quota_max_messages, self.recipient_quota_max_bytes,
                 )
+                # Return value ignored: if the authoritative recheck inside
+                # loses a last-moment race against the pre-filter above, the
+                # cursor has already been advanced past this item (permanent
+                # skip either way — consistent with the quota-continue
+                # handling above).
             self._last_seen_id[peer.fingerprint] = max_id
         finally:
             if conn is not None:
