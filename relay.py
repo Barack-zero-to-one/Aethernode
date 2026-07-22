@@ -382,6 +382,16 @@ def main():
                              "relay refuses to start.")
     args = parser.parse_args()
 
+    if args.socket_path == args.gossip_socket_path:
+        # _acquire_relay_lock is called once per path below; flock() locks
+        # are scoped per open-file-description, not per process, so a
+        # second open()+flock() on the SAME lock file from THIS SAME
+        # process is denied by the OS exactly like a genuine second
+        # instance would be — producing a factually wrong "another relay
+        # instance is already running" error instead of this clear one.
+        print("  ERROR: --socket-path and --gossip-socket-path must be different.", file=sys.stderr)
+        sys.exit(1)
+
     direct_transport_unlocked = args.gossip_transport == "direct"
     if direct_transport_unlocked and os.environ.get(gossip.DIRECT_TRANSPORT_ENV_VAR) != "1":
         print(f"  ERROR: --gossip-transport direct requires ${gossip.DIRECT_TRANSPORT_ENV_VAR}=1 "
@@ -389,36 +399,41 @@ def main():
               f"used outside same-host testing — see README § Federation.", file=sys.stderr)
         sys.exit(1)
 
-    db = init_db(args.db)
-
-    # Held for the lifetime of the process — guarantees only one relay
-    # instance can ever bind/unlink each socket path at a time.
-    _lock = _acquire_relay_lock(args.socket_path)
-    _prepare_socket_path(args.socket_path)
-    _gossip_lock = _acquire_relay_lock(args.gossip_socket_path)
-    _prepare_socket_path(args.gossip_socket_path)
-
-    relay_identity_dir = Path(args.relay_identity_dir)
-    own_key_path, own_cert_path = gossip.load_or_generate_relay_identity(relay_identity_dir)
-    own_fingerprint = gossip.relay_fingerprint(gossip.load_cert(own_cert_path))
-
-    trust_store = gossip.TrustStore(Path(args.peers_file), Path(args.blacklist_file))
-    gossip_ctx = gossip.GossipContext(
-        own_cert_path=own_cert_path,
-        own_key_path=own_key_path,
-        trust_store=trust_store,
-        direct_transport_unlocked=direct_transport_unlocked,
-    )
-    anti_entropy = gossip.AntiEntropySync(
-        db=db, db_lock=DB_LOCK, trust_store=trust_store,
-        validate_publish=_validate_publish_payload, gossip_ctx=gossip_ctx,
-        own_cert_path=own_cert_path, own_key_path=own_key_path,
-        direct_transport_unlocked=direct_transport_unlocked,
-        interval_s=args.gossip_anti_entropy_interval,
-    )
-
+    db = None
     server = gossip_server = gossip_thread = None
+    anti_entropy = gossip_ctx = None
+    server_started = gossip_server_started = False
     try:
+        db = init_db(args.db)
+
+        # Held for the lifetime of the process — guarantees only one relay
+        # instance can ever bind/unlink each socket path at a time.
+        _lock = _acquire_relay_lock(args.socket_path)
+        _prepare_socket_path(args.socket_path)
+        _gossip_lock = _acquire_relay_lock(args.gossip_socket_path)
+        _prepare_socket_path(args.gossip_socket_path)
+
+        relay_identity_dir = Path(args.relay_identity_dir)
+        own_key_path, own_cert_path = gossip.load_or_generate_relay_identity(relay_identity_dir)
+        own_fingerprint = gossip.relay_fingerprint(gossip.load_cert(own_cert_path))
+
+        trust_store = gossip.TrustStore(Path(args.peers_file), Path(args.blacklist_file))
+        gossip_ctx = gossip.GossipContext(
+            own_cert_path=own_cert_path,
+            own_key_path=own_key_path,
+            trust_store=trust_store,
+            direct_transport_unlocked=direct_transport_unlocked,
+            max_body_bytes=_MAX_BODY_BYTES,
+        )
+        anti_entropy = gossip.AntiEntropySync(
+            db=db, db_lock=DB_LOCK, trust_store=trust_store,
+            validate_publish=_validate_publish_payload, gossip_ctx=gossip_ctx,
+            own_cert_path=own_cert_path, own_key_path=own_key_path,
+            direct_transport_unlocked=direct_transport_unlocked,
+            max_body_bytes=_MAX_BODY_BYTES,
+            interval_s=args.gossip_anti_entropy_interval,
+        )
+
         server = RelayUnixHTTPServer(args.socket_path, RelayHandler)
         os.chmod(args.socket_path, 0o660)  # local-only; group access needed by the Tor process — see README
         server.db = db
@@ -437,6 +452,7 @@ def main():
 
         gossip_thread = threading.Thread(target=gossip_server.serve_forever, daemon=True, name="gossip-listener")
         gossip_thread.start()
+        gossip_server_started = True
         anti_entropy.start()
 
         peer_count = len(trust_store.active_peers())
@@ -453,6 +469,7 @@ def main():
         print(f"  Press Ctrl+C to stop.\n")
 
         try:
+            server_started = True
             server.serve_forever()
         except KeyboardInterrupt:
             print("\n  Relay stopped cleanly.")
@@ -461,28 +478,42 @@ def main():
         # (e.g. a handler thread still touching `db` when close() runs, since
         # daemon_threads=True means in-flight threads are never joined first)
         # can never prevent the others from running.
-        try:
-            anti_entropy.stop()
-        except Exception:
-            pass
-        try:
-            gossip_ctx.shutdown()
-        except Exception:
-            pass
+        if anti_entropy is not None:
+            try:
+                anti_entropy.stop()
+            except Exception:
+                pass
+        if gossip_ctx is not None:
+            try:
+                gossip_ctx.shutdown()
+            except Exception:
+                pass
         if gossip_server is not None:
             try:
-                gossip_server.shutdown()
+                # .shutdown() blocks until serve_forever()'s loop notices and
+                # exits — it deadlocks forever if that loop never started
+                # (e.g. a startup failure between construction and
+                # gossip_thread.start()). server_close() just releases the
+                # listening socket directly and is always safe to call.
+                if gossip_server_started:
+                    gossip_server.shutdown()
+                else:
+                    gossip_server.server_close()
             except Exception:
                 pass
         if server is not None:
             try:
-                server.shutdown()
+                if server_started:
+                    server.shutdown()
+                else:
+                    server.server_close()
             except Exception:
                 pass
-        try:
-            db.close()
-        except Exception:
-            pass
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                pass
         try:
             os.unlink(args.socket_path)
         except OSError:

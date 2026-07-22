@@ -290,6 +290,7 @@ def main() -> int:
                     node.process.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     node.process.kill()
+                    node.process.wait(timeout=5)
         shutil.rmtree(workdir, ignore_errors=True)
 
 
