@@ -24,6 +24,12 @@ AetherNode achieves this by eliminating the trusted third party at every layer o
        │
        ▼
   ┌─────────────────┐
+  │  Pad plaintext  │ ◄─ fixed-size bucket
+  │  (4/16/64 KB)   │    (traffic-size unlinkability)
+  └────────┬────────┘
+           │  padded plaintext
+           ▼
+  ┌─────────────────┐
   │  AES-256-GCM    │ ◄─ random 256-bit key
   │  Encrypt msg    │    + 96-bit nonce
   └────────┬────────┘
@@ -36,23 +42,28 @@ AetherNode achieves this by eliminating the trusted third party at every layer o
            │  encrypted_key
            ▼
   ┌─────────────────┐
-  │  RSA-PSS Sign   │ ◄─ Barack Private Key
-  │  Full payload   │
+  │  RSA-PSS Sign   │ ◄─ Barack Private Key, over the
+  │  Full payload   │    full payload incl. expires_at
   └────────┬────────┘
            │
            ▼
-      POST /publish ──────────────► Verify signature only    ──────► GET /fetch
-                                    Store encrypted blob                  │
-                                    (cannot read, cannot forge)           ▼
-                                                                 Verify RSA-PSS ✓
-                                                                          │
-                                                                 RSA-OAEP unwrap AES key
-                                                                          │
-                                                                 AES-256-GCM decrypt
-                                                                          │
-                                                                          ▼
-                                                                    "Hello, Mbondo"
+  POST /publish              Verify sig, TTL bounds,          GET /fetch
+  (via Tor SOCKS5) ─────────► and recipient quota    ───────► (via Tor SOCKS5)
+                              Store + fan out to peers               │
+                              (cannot read, cannot forge)             ▼
+                                                            Verify RSA-PSS ✓
+                                                                       │
+                                                            RSA-OAEP unwrap AES key
+                                                                       │
+                                                            AES-256-GCM decrypt
+                                                                       │
+                                                            Strip padding
+                                                                       │
+                                                                       ▼
+                                                                 "Hello, Mbondo"
 ```
+
+The relay's TTL, quota, and deletion enforcement, and the mesh-wide propagation of both new messages and deletion requests to trusted peers, are covered in full in the Data Retention and Federation sections below; this diagram shows only the client-to-client cryptographic path itself, unchanged in shape since the relay still never touches anything but ciphertext it cannot read and cannot forge.
 
 ---
 
