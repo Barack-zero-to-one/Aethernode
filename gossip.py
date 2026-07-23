@@ -19,9 +19,11 @@ imported by client.py or protocol.py; it must never import relay.py.
 """
 
 import base64
+import getpass
 import hashlib
 import http.client
 import json
+import os
 import socket
 import socketserver
 import ssl
@@ -69,7 +71,36 @@ DIRECT_TRANSPORT_ENV_VAR = "AETHERNODE_UNSAFE_DIRECT_GOSSIP_TEST_ONLY"
 
 # ─── Relay Identity (X.509, distinct from end-user identity) ──────────────────
 
-def generate_relay_identity(identity_dir: Path) -> None:
+def _resolve_key_passphrase(env_var_name: str | None, *, required: bool = False,
+                              confirm: bool = False) -> bytes | None:
+    """
+    Relay-side twin of client.py's _resolve_passphrase (duplicated, not
+    imported — gossip.py must never import client.py). Same semantics:
+    required=False (generation time) returns None outright if no env var
+    name was given, preserving the original unencrypted-by-default
+    behavior; required=True (loading an already-encrypted key) always
+    resolves an actual passphrase, since the on-disk key's own format is
+    authoritative regardless of this invocation's flags. Checks the named
+    environment variable first — the only way to keep a relay usable under
+    unattended restart (systemd, a process manager), since an interactive
+    prompt would hang a non-interactive service start — falling back to an
+    interactive getpass() prompt for foreground/manual runs.
+    """
+    if not required and env_var_name is None:
+        return None
+    raw = os.environ.get(env_var_name) if env_var_name else None
+    if raw is not None:
+        return raw.encode()
+    passphrase = getpass.getpass("  Enter the relay identity key passphrase: ")
+    if confirm:
+        again = getpass.getpass("  Confirm passphrase: ")
+        if passphrase != again:
+            print("  ERROR: passphrases did not match.", file=sys.stderr)
+            sys.exit(1)
+    return passphrase.encode()
+
+
+def generate_relay_identity(identity_dir: Path, key_passphrase_env: str | None = None) -> bytes | None:
     """
     Generate this relay's own RSA-2048 keypair and a self-signed X.509
     certificate, persisted to <identity_dir>/relay_key.pem and relay_cert.pem.
@@ -77,6 +108,13 @@ def generate_relay_identity(identity_dir: Path) -> None:
     Mirrors client.py's key-generation bootstrap, but writes to a directory
     that is never ~/.aether or $AETHER_HOME — a relay's gossip identity and
     an end user's messaging identity must never be confused or shared.
+
+    Returns the resolved passphrase (or None if generated unencrypted), so
+    the caller can reuse it for every later ssl.SSLContext.load_cert_chain()
+    call (the relay's key is never parsed into a Python key object the way
+    client.py's is — OpenSSL loads the PEM file directly, once at server
+    startup and again for every single outbound gossip connection) without
+    prompting more than once per process.
     """
     identity_dir.mkdir(parents=True, exist_ok=True)
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
@@ -116,11 +154,16 @@ def generate_relay_identity(identity_dir: Path) -> None:
     key_path  = identity_dir / RELAY_KEY_FILE
     cert_path = identity_dir / RELAY_CERT_FILE
 
+    passphrase = _resolve_key_passphrase(key_passphrase_env, confirm=True)
+    encryption = (
+        serialization.BestAvailableEncryption(passphrase)
+        if passphrase is not None else serialization.NoEncryption()
+    )
     key_path.write_bytes(
         key.private_bytes(
             serialization.Encoding.PEM,
             serialization.PrivateFormat.PKCS8,
-            serialization.NoEncryption(),
+            encryption,
         )
     )
     cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
@@ -130,16 +173,40 @@ def generate_relay_identity(identity_dir: Path) -> None:
     except (AttributeError, NotImplementedError, OSError):
         pass
 
+    if passphrase is None:
+        print(f"  WARNING: relay identity key stored unencrypted on disk. Use "
+              f"--relay-key-passphrase-env to protect it — see README § Key Storage.",
+              file=sys.stderr)
     print(f"  New relay identity generated. Key stored in {identity_dir}")
+    return passphrase
 
 
-def load_or_generate_relay_identity(identity_dir: Path) -> tuple[Path, Path]:
-    """Bootstraps a relay identity on first launch. Returns (key_path, cert_path)."""
+def load_or_generate_relay_identity(identity_dir: Path,
+                                      key_passphrase_env: str | None = None) -> tuple[Path, Path, bytes | None]:
+    """Bootstraps a relay identity on first launch. Returns (key_path, cert_path, key_password)."""
     key_path  = identity_dir / RELAY_KEY_FILE
     cert_path = identity_dir / RELAY_CERT_FILE
     if not (key_path.exists() and cert_path.exists()):
-        generate_relay_identity(identity_dir)
-    return key_path, cert_path
+        passphrase = generate_relay_identity(identity_dir, key_passphrase_env)
+        return key_path, cert_path, passphrase
+
+    # Existing identity — detect whether it's encrypted the same way
+    # client.py does (try password=None, catch the specific "encrypted but
+    # no password given" error), so an already-encrypted key still works
+    # even if this particular invocation didn't pass
+    # --relay-key-passphrase-env.
+    key_data = key_path.read_bytes()
+    try:
+        serialization.load_pem_private_key(key_data, password=None)
+        return key_path, cert_path, None
+    except TypeError:
+        passphrase = _resolve_key_passphrase(key_passphrase_env, required=True)
+        try:
+            serialization.load_pem_private_key(key_data, password=passphrase)
+        except (ValueError, TypeError) as exc:
+            print(f"  ERROR: could not decrypt relay identity key: {exc}", file=sys.stderr)
+            sys.exit(1)
+        return key_path, cert_path, passphrase
 
 
 def load_cert(cert_path: Path) -> x509.Certificate:
@@ -293,7 +360,8 @@ class TrustStore:
 _GOSSIP_TLS_VERSION = ssl.TLSVersion.TLSv1_2
 
 
-def build_server_ssl_context(cert_path: Path, key_path: Path, trust_store: TrustStore) -> ssl.SSLContext:
+def build_server_ssl_context(cert_path: Path, key_path: Path, trust_store: TrustStore,
+                               key_password: bytes | None = None) -> ssl.SSLContext:
     """
     verify_mode=CERT_REQUIRED makes this mutual TLS: the server refuses any
     connection whose peer doesn't present a certificate matching one of the
@@ -301,11 +369,15 @@ def build_server_ssl_context(cert_path: Path, key_path: Path, trust_store: Trust
     validation only succeeds when the presented cert IS one of the bundled
     anchors — this is fingerprint pinning enforced natively by OpenSSL during
     the handshake itself, before any request is ever read.
+
+    key_password is passed straight through to OpenSSL's own PEM parsing in
+    load_cert_chain (None is the correct, safe value for an unencrypted
+    key — this project's original, still-default behavior).
     """
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.minimum_version = _GOSSIP_TLS_VERSION
     ctx.maximum_version = _GOSSIP_TLS_VERSION
-    ctx.load_cert_chain(certfile=str(cert_path), keyfile=str(key_path))
+    ctx.load_cert_chain(certfile=str(cert_path), keyfile=str(key_path), password=key_password)
     ctx.check_hostname = False  # pinning is by cert identity, not hostname
     ctx.verify_mode = ssl.CERT_REQUIRED
     cadata = trust_store.trusted_cadata()
@@ -316,12 +388,14 @@ def build_server_ssl_context(cert_path: Path, key_path: Path, trust_store: Trust
     return ctx
 
 
-def build_client_ssl_context(cert_path: Path, key_path: Path, peer: "PeerConfig") -> ssl.SSLContext:
-    """Per-peer context: trusts ONLY that one peer's pinned cert when dialing out."""
+def build_client_ssl_context(cert_path: Path, key_path: Path, peer: "PeerConfig",
+                               key_password: bytes | None = None) -> ssl.SSLContext:
+    """Per-peer context: trusts ONLY that one peer's pinned cert when dialing out.
+    key_password: see build_server_ssl_context — same OpenSSL-level pass-through."""
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.minimum_version = _GOSSIP_TLS_VERSION
     ctx.maximum_version = _GOSSIP_TLS_VERSION
-    ctx.load_cert_chain(certfile=str(cert_path), keyfile=str(key_path))
+    ctx.load_cert_chain(certfile=str(cert_path), keyfile=str(key_path), password=key_password)
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_REQUIRED
     ctx.load_verify_locations(cadata=peer.cert_pem_text)
@@ -350,7 +424,8 @@ class GossipUnixTLSServer(socketserver.ThreadingMixIn, HTTPServer):
     address_family = _AF_UNIX if _AF_UNIX is not None else socket.AF_INET  # never actually used; see __init__
     daemon_threads  = True
 
-    def __init__(self, server_address, RequestHandlerClass, ssl_context: ssl.SSLContext, trust_store: TrustStore):
+    def __init__(self, server_address, RequestHandlerClass, ssl_context: ssl.SSLContext, trust_store: TrustStore,
+                 max_concurrent_connections: int = 100):
         if _AF_UNIX is None:
             raise OSError(
                 "AF_UNIX sockets are not available on this platform. "
@@ -358,6 +433,15 @@ class GossipUnixTLSServer(socketserver.ThreadingMixIn, HTTPServer):
             )
         self.ssl_context = ssl_context
         self.trust_store = trust_store
+        # Same connection-flood cap as relay.py's RelayUnixHTTPServer (see
+        # its __init__ for the full rationale), doubly important here: the
+        # expensive part — mTLS handshake, certificate verification, inside
+        # finish_request() below — runs *inside* the worker thread, after
+        # acceptance but before any authentication succeeds. Gating at
+        # process_request()/process_request_thread() (not finish_request()
+        # itself) covers the handshake too, since ThreadingMixIn always
+        # calls finish_request() from inside process_request_thread().
+        self._connection_semaphore = threading.BoundedSemaphore(max_concurrent_connections)
         super().__init__(server_address, RequestHandlerClass)
 
     def server_bind(self):
@@ -367,6 +451,34 @@ class GossipUnixTLSServer(socketserver.ThreadingMixIn, HTTPServer):
         socketserver.TCPServer.server_bind(self)
         self.server_name = str(self.server_address)
         self.server_port = 0
+
+    def process_request(self, request, client_address):
+        if not self._connection_semaphore.acquire(blocking=False):
+            try:
+                request.close()
+            except OSError:
+                pass
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            # ThreadingMixIn.process_request's only realistic failure mode
+            # is Thread.start() itself raising (e.g. RuntimeError: can't
+            # start new thread -- exactly the resource-exhaustion scenario
+            # this cap exists to mitigate). When that happens,
+            # process_request_thread's own finally-release is never
+            # reached, since the thread never started running at all;
+            # release here instead so a thread-spawn failure doesn't
+            # permanently shrink the effective cap by one, then re-raise
+            # so the underlying error surfaces exactly as it always did.
+            self._connection_semaphore.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._connection_semaphore.release()
 
     def finish_request(self, request, client_address):
         try:
@@ -463,6 +575,33 @@ class GossipHandler(BaseHTTPRequestHandler):
                 ).fetchall()
             messages = [{"id": row[0], "payload": json.loads(row[1])} for row in rows]
             self._send_json(200, {"messages": messages, "count": len(messages)})
+            return
+
+        if parsed.path == "/gossip/deletions":
+            # Anti-entropy reconciliation for deletions, mirroring
+            # /gossip/messages exactly. Only CONFIRMED tombstones are ever
+            # returned — pending rows are relay-local bookkeeping that
+            # already resolve on their own once the target message arrives
+            # via ordinary message gossip (see resolve_deletion_request);
+            # syncing them separately would risk a peer treating an
+            # unverified pending claim as authoritative.
+            params = parse_qs(parsed.query)
+            raw_since = params.get("since_id", ["0"])[0]
+            since_id = int(raw_since) if raw_since.isdigit() else 0
+            with self.server.db_lock:
+                rows = self.server.db.execute(
+                    "SELECT id, target_signature, requester_pubkey, requester_recipient_id, requested_at "
+                    "FROM deletion_requests WHERE id > ? AND confirmed = 1 ORDER BY id ASC LIMIT ?",
+                    (since_id, GOSSIP_PULL_BATCH_LIMIT),
+                ).fetchall()
+            deletions = [
+                {
+                    "id": row[0], "target_signature": row[1], "requester_pubkey": row[2],
+                    "requester_recipient_id": row[3], "requested_at": row[4],
+                }
+                for row in rows
+            ]
+            self._send_json(200, {"deletions": deletions, "count": len(deletions)})
             return
 
         self._send_json(404, {"error": "Not found"})
@@ -803,11 +942,50 @@ def resolve_deletion_request(db: sqlite3.Connection, db_lock: threading.Lock,
 
     with db_lock:
         if matched:
-            db.execute("UPDATE deletion_requests SET confirmed = 1 WHERE target_signature = ?", (signature,))
+            # _apply_confirmed_deletion (INSERT OR REPLACE, a fresh
+            # autoincrement id), not a plain UPDATE that would preserve
+            # this row's original id: a peer's /gossip/deletions cursor
+            # only advances based on ids it has actually seen returned
+            # (confirmed=1 rows only), so if other, higher-id rows were
+            # confirmed and synced before this pending row got resolved, a
+            # plain UPDATE would leave this row's id permanently below
+            # that peer's cursor — confirmed here, but invisible to that
+            # peer's anti-entropy sync forever. The message itself was
+            # never inserted (this function is the last gate BEFORE
+            # insertion), so _apply_confirmed_deletion's DELETE FROM
+            # messages is a harmless no-op here.
+            _apply_confirmed_deletion(db, signature, requester_pubkey, recipient_id,
+                                       datetime.now(timezone.utc).isoformat())
         else:
             db.execute("DELETE FROM deletion_requests WHERE target_signature = ?", (signature,))
         db.commit()
     return matched
+
+
+def _apply_confirmed_deletion(db: sqlite3.Connection, target_signature: str, requester_pubkey: str,
+                                requester_recipient_id: str, requested_at: str) -> None:
+    """
+    Must be called with db_lock already held, and does not commit-and-return
+    on its own (callers wrap it in whatever else their transaction needs and
+    commit once). Secure-deletes the message row if this relay currently
+    holds it — a no-op DELETE affecting 0 rows otherwise, which SQLite
+    handles fine — and writes or upgrades a confirmed tombstone either way.
+
+    Shared by two callers that reach a confirmed deletion through different
+    paths: handle_delete_request, where THIS relay is the one performing
+    the authorization check against the requester's signed request; and
+    AntiEntropySync's deletion-sync pass, reconciling a deletion a peer
+    already confirmed, where no fresh authorization check is needed or
+    possible — the peer already performed it, and this relay trusts that
+    peer the same way it already trusts it for ordinary message gossip.
+    """
+    db.execute("DELETE FROM messages WHERE signature = ?", (target_signature,))
+    db.execute(
+        "INSERT OR REPLACE INTO deletion_requests "
+        "(target_signature, requester_pubkey, requester_recipient_id, confirmed, requested_at) "
+        "VALUES (?, ?, ?, 1, ?)",
+        (target_signature, requester_pubkey, requester_recipient_id, requested_at),
+    )
 
 
 def handle_delete_request(db: sqlite3.Connection, db_lock: threading.Lock, payload: dict,
@@ -849,18 +1027,12 @@ def handle_delete_request(db: sqlite3.Connection, db_lock: threading.Lock, paylo
         if row is not None and row[0] in candidate_ids:
             # Authorized: secure-delete the message (PRAGMA secure_delete +
             # journal_mode=TRUNCATE, set in init_db, make this an actual
-            # overwrite, not just a freed page), write a confirmed tombstone.
-            # requester_recipient_id is stored as the actually-matched
-            # recipient_id for reference; nothing reads this column back —
-            # authorization for a FUTURE lookup on this same signature is
-            # decided by target_signature/confirmed alone.
-            db.execute("DELETE FROM messages WHERE signature = ?", (target_signature,))
-            db.execute(
-                "INSERT OR REPLACE INTO deletion_requests "
-                "(target_signature, requester_pubkey, requester_recipient_id, confirmed, requested_at) "
-                "VALUES (?, ?, ?, 1, ?)",
-                (target_signature, requester_pubkey, row[0], now),
-            )
+            # overwrite, not just a freed page) and write a confirmed
+            # tombstone. requester_recipient_id is stored as the actually-
+            # matched recipient_id for reference; nothing reads this column
+            # back — authorization for a FUTURE lookup on this same
+            # signature is decided by target_signature/confirmed alone.
+            _apply_confirmed_deletion(db, target_signature, requester_pubkey, row[0], now)
             db.commit()
             return {"status": "deleted", "propagation": "async"}, True
 
@@ -983,24 +1155,23 @@ def _read_bounded_response(resp: http.client.HTTPResponse, max_bytes: int) -> by
 
 def _push_to_peer(peer: PeerConfig, body: bytes, own_cert_path: Path, own_key_path: Path,
                    direct_transport_unlocked: bool, max_body_bytes: int,
-                   target_path: str = "/gossip/publish") -> None:
+                   target_path: str = "/gossip/publish", own_key_password: bytes | None = None) -> None:
     if _refuse_if_direct_locked(peer, direct_transport_unlocked):
         return
     conn = None
     try:
-        ssl_ctx = build_client_ssl_context(own_cert_path, own_key_path, peer)
+        ssl_ctx = build_client_ssl_context(own_cert_path, own_key_path, peer, own_key_password)
         conn = _open_connection(peer, ssl_ctx)
         conn.request("POST", target_path, body=body, headers={"Content-Type": "application/json"})
         resp = conn.getresponse()
         _read_bounded_response(resp, max_body_bytes)
         if resp.status == 429:
-            # No retry here by design (push is fire-and-forget). For
-            # /gossip/publish, the peer's own next anti-entropy round will
-            # naturally re-offer this message once its rate-limit budget
-            # refills, since a 429'd push was never inserted anywhere;
-            # /gossip/delete has no anti-entropy backstop, so a rate-limited
-            # delete fan-out is simply lost on that one peer — logged either
-            # way for operator visibility into fan-out throttling.
+            # No retry here by design (push is fire-and-forget) — the
+            # peer's own next anti-entropy round will naturally re-offer
+            # what a 429'd push never got inserted anywhere: for
+            # /gossip/publish via _sync_with_peer, for /gossip/delete via
+            # _sync_deletions_with_peer. Logged either way for operator
+            # visibility into fan-out throttling.
             print(f"  [gossip] push to peer '{peer.label}' ({target_path}) was rate-limited", file=sys.stderr)
     except Exception as exc:
         # An unreachable peer is expected steady state under eventual
@@ -1018,9 +1189,10 @@ class GossipContext:
 
     def __init__(self, own_cert_path: Path, own_key_path: Path, trust_store: TrustStore,
                  direct_transport_unlocked: bool, max_body_bytes: int,
-                 max_workers: int = DEFAULT_FANOUT_WORKERS):
+                 max_workers: int = DEFAULT_FANOUT_WORKERS, own_key_password: bytes | None = None):
         self.own_cert_path = own_cert_path
         self.own_key_path = own_key_path
+        self.own_key_password = own_key_password
         self.trust_store = trust_store
         self.direct_transport_unlocked = direct_transport_unlocked
         self.max_body_bytes = max_body_bytes
@@ -1035,6 +1207,7 @@ class GossipContext:
             self._pool.submit(
                 _push_to_peer, peer, body, self.own_cert_path, self.own_key_path,
                 self.direct_transport_unlocked, self.max_body_bytes, target_path,
+                self.own_key_password,
             )
 
     def shutdown(self) -> None:
@@ -1059,7 +1232,8 @@ class AntiEntropySync:
                  gossip_pull_limiter: "ratelimit.RateLimiter",
                  recipient_quota_max_messages: int, recipient_quota_max_bytes: int,
                  max_ttl_seconds: int,
-                 interval_s: int = DEFAULT_ANTI_ENTROPY_INTERVAL):
+                 interval_s: int = DEFAULT_ANTI_ENTROPY_INTERVAL,
+                 own_key_password: bytes | None = None):
         self.db = db
         self.db_lock = db_lock
         self.trust_store = trust_store
@@ -1067,6 +1241,7 @@ class AntiEntropySync:
         self.gossip_ctx = gossip_ctx
         self.own_cert_path = own_cert_path
         self.own_key_path = own_key_path
+        self.own_key_password = own_key_password
         self.direct_transport_unlocked = direct_transport_unlocked
         self.max_body_bytes = max_body_bytes
         self.gossip_pull_limiter = gossip_pull_limiter
@@ -1079,6 +1254,10 @@ class AntiEntropySync:
         # distinct peers.json entries could share, which would otherwise
         # make them silently overwrite each other's catch-up cursor.
         self._last_seen_id: dict[str, int] = {}
+        # Separate cursor for the deletion-reconciliation pass below — a
+        # distinct table with its own id sequence, so it must not share a
+        # cursor with message sync.
+        self._last_seen_deletion_id: dict[str, int] = {}
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, daemon=True, name="gossip-anti-entropy")
 
@@ -1095,6 +1274,10 @@ class AntiEntropySync:
                     self._sync_with_peer(peer)
                 except Exception as exc:
                     print(f"  [gossip] anti-entropy sync with '{peer.label}' failed: {exc}", file=sys.stderr)
+                try:
+                    self._sync_deletions_with_peer(peer)
+                except Exception as exc:
+                    print(f"  [gossip] anti-entropy deletion sync with '{peer.label}' failed: {exc}", file=sys.stderr)
             self._stop.wait(self.interval_s)
 
     def _sync_with_peer(self, peer: PeerConfig) -> None:
@@ -1104,7 +1287,7 @@ class AntiEntropySync:
         since_id = self._last_seen_id.get(peer.fingerprint, 0)
         conn = None
         try:
-            ssl_ctx = build_client_ssl_context(self.own_cert_path, self.own_key_path, peer)
+            ssl_ctx = build_client_ssl_context(self.own_cert_path, self.own_key_path, peer, self.own_key_password)
             conn = _open_connection(peer, ssl_ctx)
             conn.request("GET", f"/gossip/messages?since_id={since_id}")
             resp = conn.getresponse()
@@ -1190,6 +1373,85 @@ class AntiEntropySync:
                 # skip either way — consistent with the quota-continue
                 # handling above).
             self._last_seen_id[peer.fingerprint] = max_id
+        finally:
+            if conn is not None:
+                conn.close()
+
+    def _sync_deletions_with_peer(self, peer: PeerConfig) -> None:
+        """
+        Anti-entropy backstop for deletion propagation, mirroring
+        _sync_with_peer's structure and shape for messages. Deletions
+        otherwise only ever propagate via one-shot async fan-out
+        (GossipContext.schedule_fanout, from handle_delete_request); if
+        that single push fails for a peer that already holds the target
+        message (a brief network blip, the peer restarting mid-fan-out),
+        that peer would never learn the message was deleted through any
+        other mechanism. This closes that gap the same way message
+        anti-entropy already does: periodically pull what a peer has that
+        this relay doesn't.
+
+        No fresh authorization check is performed on the pulled rows — a
+        confirmed=1 row on the source peer already passed
+        handle_delete_request's day-search authorization check when it was
+        created there, and this relay already trusts that peer via the
+        same mTLS-pinned mechanism it trusts for ordinary message gossip.
+
+        Purely passive: this only writes the reconciled tombstone into
+        THIS relay's own deletion_requests table, the same table
+        GossipHandler's /gossip/deletions endpoint reads from — so once
+        applied here, it becomes available to whichever of THIS relay's
+        own peers pull from it next, achieving the same transitive,
+        multi-hop convergence message anti-entropy gets "for free" from
+        peers re-sharing their own already-accumulated messages table. No
+        active re-fan-out is attempted: doing so would require a validly
+        re-signable delete request, but only the request's decomposed,
+        already-verified fields are stored, not its original signature —
+        reconstructing a fresh signed envelope isn't possible without the
+        requester's private key, and isn't needed for correctness here.
+        """
+        if _refuse_if_direct_locked(peer, self.direct_transport_unlocked):
+            return
+
+        since_id = self._last_seen_deletion_id.get(peer.fingerprint, 0)
+        conn = None
+        try:
+            ssl_ctx = build_client_ssl_context(self.own_cert_path, self.own_key_path, peer, self.own_key_password)
+            conn = _open_connection(peer, ssl_ctx)
+            conn.request("GET", f"/gossip/deletions?since_id={since_id}")
+            resp = conn.getresponse()
+            body = _read_bounded_response(resp, self.max_body_bytes)
+            if resp.status != 200:
+                return
+
+            data = json.loads(body)
+            max_id = since_id
+            for item in data.get("deletions", []):
+                target_signature = item.get("target_signature")
+                item_id = item.get("id", max_id)
+                if not isinstance(target_signature, str):
+                    max_id = max(max_id, item_id)
+                    continue
+
+                if not self.gossip_pull_limiter.check_global():
+                    break  # temporary — retry from here next round
+                if not self.gossip_pull_limiter.check_identity(peer.fingerprint):
+                    self.gossip_pull_limiter.refund_global()
+                    break
+
+                max_id = max(max_id, item_id)
+                with self.db_lock:
+                    already_confirmed = self.db.execute(
+                        "SELECT 1 FROM deletion_requests WHERE target_signature = ? AND confirmed = 1",
+                        (target_signature,)
+                    ).fetchone()
+                    if already_confirmed is None:
+                        _apply_confirmed_deletion(
+                            self.db, target_signature,
+                            item.get("requester_pubkey", ""), item.get("requester_recipient_id", ""),
+                            item.get("requested_at") or datetime.now(timezone.utc).isoformat(),
+                        )
+                        self.db.commit()
+            self._last_seen_deletion_id[peer.fingerprint] = max_id
         finally:
             if conn is not None:
                 conn.close()

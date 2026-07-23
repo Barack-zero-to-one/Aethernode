@@ -37,6 +37,19 @@ import gossip
 import ratelimit
 from protocol import MAX_PUBLISH_BODY_BYTES
 
+# gossip.py's own print statements (e.g. its relay-key-unencrypted warning)
+# share this same process's stdout/stderr, so reconfiguring here covers
+# them too. See client.py's identical block for the full rationale — a
+# legacy 8-bit console encoding (cp1252, still the default on native
+# Windows, including GitHub Actions' windows-latest runners, confirmed by
+# an actual CI failure) can't represent this codebase's Unicode symbols at
+# all and crashes instead of printing them.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 # Maximum bytes accepted from a single POST body — guards against memory
 # exhaustion. Derived from protocol.MAX_PUBLISH_BODY_BYTES (the worst-case
 # payload size for client.py's largest padding bucket) with roughly 50%
@@ -198,7 +211,8 @@ def init_db(path: str) -> sqlite3.Connection:
     )
     conn.execute("""
         CREATE TABLE IF NOT EXISTS deletion_requests (
-            target_signature       TEXT PRIMARY KEY,
+            id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+            target_signature       TEXT NOT NULL UNIQUE,
             requester_pubkey       TEXT NOT NULL,
             requester_recipient_id TEXT NOT NULL,
             confirmed               INTEGER NOT NULL,
@@ -597,12 +611,24 @@ class RelayUnixHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     address_family = _AF_UNIX if _AF_UNIX is not None else socket.AF_INET  # never actually used; see __init__
     daemon_threads  = True
 
-    def __init__(self, server_address, RequestHandlerClass):
+    def __init__(self, server_address, RequestHandlerClass, max_concurrent_connections: int = 200):
         if _AF_UNIX is None:
             raise OSError(
                 "AF_UNIX sockets are not available on this platform. "
                 "AetherNode's relay requires Linux, macOS, or WSL."
             )
+        # ThreadingMixIn's stock process_request spawns an unconditional new
+        # thread per accepted connection with no cap at all — a connection
+        # flood from an unauthenticated source (this listener accepts a
+        # connection before any request has even been read, let alone
+        # validated) can exhaust threads/file descriptors with no limit.
+        # Verified via inspect.getsource(socketserver.ThreadingMixIn):
+        # process_request spawns process_request_thread, which always runs
+        # finish_request then shutdown_request in a finally — the semaphore
+        # below is acquired before a thread is even spawned (rejecting
+        # outright, not queuing, once at the cap) and released when that
+        # thread's whole lifetime completes.
+        self._connection_semaphore = threading.BoundedSemaphore(max_concurrent_connections)
         super().__init__(server_address, RequestHandlerClass)
 
     def server_bind(self):
@@ -613,6 +639,35 @@ class RelayUnixHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
         socketserver.TCPServer.server_bind(self)
         self.server_name = str(self.server_address)  # cosmetic only, unused for routing
         self.server_port = 0
+
+    def process_request(self, request, client_address):
+        if not self._connection_semaphore.acquire(blocking=False):
+            # At the concurrent-connection cap — reject immediately instead
+            # of spawning a thread that would just queue up behind
+            # already-busy ones, which would just move the exhaustion
+            # point rather than close it.
+            try:
+                request.close()
+            except OSError:
+                pass
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            # Thread.start() itself can raise (e.g. RuntimeError: can't
+            # start new thread) under the exact resource pressure this cap
+            # exists to mitigate; process_request_thread's finally-release
+            # never runs if the thread never started, so release here
+            # instead of permanently shrinking the effective cap by one,
+            # then re-raise so the underlying error surfaces as before.
+            self._connection_semaphore.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._connection_semaphore.release()
 
 
 # ─── Background Retention Sweep ────────────────────────────────────────────────
@@ -681,6 +736,23 @@ def main():
                              "(relay_key.pem / relay_cert.pem), distinct from any end-user "
                              "identity. Auto-generated on first launch "
                              "(default: ./aether-relay-identity).")
+    parser.add_argument("--relay-key-passphrase-env", metavar="ENV_VAR", default=None,
+                        help="Name of an environment variable holding a passphrase to encrypt/"
+                             "decrypt this relay's identity key at rest. Set this variable in "
+                             "whatever environment starts the relay (a systemd unit's "
+                             "EnvironmentFile=, a process manager's env config) so unattended "
+                             "restarts keep working — an interactive prompt would otherwise hang "
+                             "a non-interactive service start. Omitted by default, which keeps "
+                             "the original unencrypted key file — see README § Key Storage.")
+    parser.add_argument("--max-concurrent-connections", type=int, default=200,
+                        help="Cap on concurrent in-flight connections to the client-facing "
+                             "listener before they're rejected outright, closing an "
+                             "unauthenticated connection-flood exhaustion vector (default: 200).")
+    parser.add_argument("--gossip-max-concurrent-connections", type=int, default=100,
+                        help="Same cap as --max-concurrent-connections, for the peer-facing "
+                             "mTLS gossip listener, where each connection is more expensive due "
+                             "to the handshake and a trusted-peer mesh is typically smaller "
+                             "(default: 100).")
     parser.add_argument("--gossip-socket-path", default="./aether-relay-gossip.sock",
                         help="Unix domain socket for the mTLS gossip listener (default: "
                              "./aether-relay-gossip.sock). Point a SECOND torrc "
@@ -788,13 +860,16 @@ def main():
         _prepare_socket_path(args.gossip_socket_path)
 
         relay_identity_dir = Path(args.relay_identity_dir)
-        own_key_path, own_cert_path = gossip.load_or_generate_relay_identity(relay_identity_dir)
+        own_key_path, own_cert_path, own_key_password = gossip.load_or_generate_relay_identity(
+            relay_identity_dir, args.relay_key_passphrase_env
+        )
         own_fingerprint = gossip.relay_fingerprint(gossip.load_cert(own_cert_path))
 
         trust_store = gossip.TrustStore(Path(args.peers_file), Path(args.blacklist_file))
         gossip_ctx = gossip.GossipContext(
             own_cert_path=own_cert_path,
             own_key_path=own_key_path,
+            own_key_password=own_key_password,
             trust_store=trust_store,
             direct_transport_unlocked=direct_transport_unlocked,
             max_body_bytes=_MAX_BODY_BYTES,
@@ -828,7 +903,7 @@ def main():
         anti_entropy = gossip.AntiEntropySync(
             db=db, db_lock=DB_LOCK, trust_store=trust_store,
             validate_publish=_validate_publish_payload, gossip_ctx=gossip_ctx,
-            own_cert_path=own_cert_path, own_key_path=own_key_path,
+            own_cert_path=own_cert_path, own_key_path=own_key_path, own_key_password=own_key_password,
             direct_transport_unlocked=direct_transport_unlocked,
             max_body_bytes=_MAX_BODY_BYTES,
             gossip_pull_limiter=gossip_pull_limiter,
@@ -842,7 +917,8 @@ def main():
             db=db, db_lock=DB_LOCK, max_ttl_seconds=args.max_ttl, interval_s=args.cleanup_interval,
         )
 
-        server = RelayUnixHTTPServer(args.socket_path, RelayHandler)
+        server = RelayUnixHTTPServer(args.socket_path, RelayHandler,
+                                       max_concurrent_connections=args.max_concurrent_connections)
         os.chmod(args.socket_path, 0o660)  # local-only; group access needed by the Tor process — see README
         server.db = db
         server.gossip_ctx = gossip_ctx
@@ -850,9 +926,10 @@ def main():
         server.recipient_quota_max_messages = args.recipient_quota_max_messages
         server.recipient_quota_max_bytes = args.recipient_quota_max_bytes
 
-        server_ssl_ctx = gossip.build_server_ssl_context(own_cert_path, own_key_path, trust_store)
+        server_ssl_ctx = gossip.build_server_ssl_context(own_cert_path, own_key_path, trust_store, own_key_password)
         gossip_server = gossip.GossipUnixTLSServer(
             args.gossip_socket_path, gossip.GossipHandler, server_ssl_ctx, trust_store,
+            max_concurrent_connections=args.gossip_max_concurrent_connections,
         )
         os.chmod(args.gossip_socket_path, 0o660)
         gossip_server.db = db
