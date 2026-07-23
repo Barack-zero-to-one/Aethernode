@@ -81,4 +81,9 @@ jobs:
       - name: Multi-day quota amplification demonstration
         run: python stress_test_quota_multiday.py
         env:
+          # MESSAGES_PER_DAY must exceed QUOTA_MAX_MESSAGES or the cap is
+          # never actually hit and the test's own assertion (realized total
+          # == quota x retention_days) fails for a scaling reason, not a
+          # real bug -- both must be scaled down together.
           AETHERNODE_AMPLIFICATION_MESSAGES_PER_DAY: ${{ env.FULL_SCALE == 'true' && '250' || '60' }}
+          AETHERNODE_AMPLIFICATION_QUOTA_MAX_MESSAGES: ${{ env.FULL_SCALE == 'true' && '200' || '40' }}
