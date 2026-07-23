@@ -55,8 +55,20 @@ NUM_TEST_MESSAGES = 15   # kept modest: full-mesh push gossip is O(N^2) real
                           # demonstrate the resilience property, not stress-test
                           # throughput.
 STARTUP_TIMEOUT_S = 10
-GOSSIP_SETTLE_S    = 3
 ANTI_ENTROPY_INTERVAL_S = 5
+# A fixed sleep here (the original design) is a guess about how long
+# full-mesh push fan-out takes to complete, and that guess turned out to be
+# wrong the first time this script was ever actually executed on a real
+# POSIX host (in CI): under a slower/shared CPU, NUM_TEST_MESSAGES messages
+# each fanning out to NUM_RELAYS-1 peers through an 8-worker thread pool
+# (gossip.DEFAULT_FANOUT_WORKERS), with a real mTLS handshake per push,
+# did not reliably finish within 3s, so relays got killed mid-propagation
+# and the test failed for a reason that had nothing to do with partition
+# resilience. Polling for actual convergence, bounded by a generous
+# ceiling, is correct on any host speed instead of tuned for whichever
+# machine happened to be used the one time someone measured it.
+CONVERGENCE_TIMEOUT_S = int(os.environ.get("AETHERNODE_SIM_CONVERGENCE_TIMEOUT_S", "30"))
+CONVERGENCE_POLL_INTERVAL_S = 0.5
 
 
 # ─── Direct (non-TLS) client-facing HTTP over a Unix socket ────────────────────
@@ -111,6 +123,21 @@ def _wait_for_socket(path: Path, timeout_s: float) -> bool:
             return True
         time.sleep(0.1)
     return False
+
+
+def _fetch_count(socket_path: Path, recipient_address: str) -> int:
+    """Returns the message count this relay currently reports for
+    recipient_address, or -1 if the relay couldn't be reached or returned
+    an error -- used only for the convergence poll below, never as a hard
+    failure by itself (a relay that's merely slow to answer one poll isn't
+    the same as one that's actually down)."""
+    try:
+        status, result = _unix_request(str(socket_path), "POST", "/fetch", {"ids": [recipient_address]})
+    except OSError:
+        return -1
+    if status != 200:
+        return -1
+    return result.get("count", -1)
 
 
 def _build_signed_payload(sender_priv, recipient_pub_b64: str, message: str) -> dict:
@@ -237,8 +264,26 @@ def main() -> int:
                 return 1
             posted[i] = plaintext
 
-        print(f"Waiting {GOSSIP_SETTLE_S}s for gossip to settle...")
-        time.sleep(GOSSIP_SETTLE_S)
+        print(f"Waiting for gossip to converge across all {NUM_RELAYS} relays "
+              f"(polling, up to {CONVERGENCE_TIMEOUT_S}s)...")
+        deadline = time.monotonic() + CONVERGENCE_TIMEOUT_S
+        converged = False
+        while time.monotonic() < deadline:
+            counts = [_fetch_count(node.socket_path, recipient_address) for node in nodes]
+            if all(c == NUM_TEST_MESSAGES for c in counts):
+                converged = True
+                break
+            time.sleep(CONVERGENCE_POLL_INTERVAL_S)
+        if converged:
+            print(f"Converged: all {NUM_RELAYS} relays hold all {NUM_TEST_MESSAGES} messages.")
+        else:
+            counts = [_fetch_count(node.socket_path, recipient_address) for node in nodes]
+            print(f"WARNING: gossip did not fully converge within {CONVERGENCE_TIMEOUT_S}s -- "
+                  f"per-relay counts: {counts} (expected {NUM_TEST_MESSAGES} everywhere). "
+                  f"Proceeding to the kill anyway; a FAIL below may reflect insufficient "
+                  f"convergence time on this host rather than a real partition-resilience "
+                  f"defect -- rerun with a larger AETHERNODE_SIM_CONVERGENCE_TIMEOUT_S if this "
+                  f"persists.", file=sys.stderr)
 
         # ── 5. Kill half the mesh. ──
         killed_indices = sorted(random.sample(range(NUM_RELAYS), int(NUM_RELAYS * KILL_FRACTION)))
