@@ -52,10 +52,13 @@ import gossip   # noqa: E402
 import protocol  # noqa: E402
 from cryptography.hazmat.primitives.asymmetric import rsa  # noqa: E402
 
-NUM_MESSAGES         = 10_000
-QUOTA_MAX_MESSAGES   = 200     # deliberately small so the cap is reached well before NUM_MESSAGES
+# Overridable via env vars so CI can run a faster-but-still-real version on
+# every push (see .github/workflows/ci.yml) while a manual/local run still
+# defaults to the full scale this stress test was designed to demonstrate.
+NUM_MESSAGES         = int(os.environ.get("AETHERNODE_STRESS_NUM_MESSAGES", "10000"))
+QUOTA_MAX_MESSAGES   = int(os.environ.get("AETHERNODE_STRESS_QUOTA_MAX_MESSAGES", "200"))
 STARTUP_TIMEOUT_S    = 10
-HEALTH_CHECK_EVERY   = 500     # messages between /health liveness checks
+HEALTH_CHECK_EVERY   = min(500, max(50, NUM_MESSAGES // 10))  # messages between /health liveness checks
 
 
 class _UnixHTTPConnection(http.client.HTTPConnection):

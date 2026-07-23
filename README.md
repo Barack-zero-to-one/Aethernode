@@ -1,5 +1,7 @@
 # AetherNode
 
+[![CI](https://github.com/Barack-zero-to-one/Aethernode/actions/workflows/ci.yml/badge.svg)](https://github.com/Barack-zero-to-one/Aethernode/actions/workflows/ci.yml)
+
 > Zero-trust decentralized messaging. Your identity is a key. Your words are unreadable to the network.
 
 ---
@@ -327,7 +329,13 @@ On startup, `relay.py` acquires an exclusive advisory lock tied to each socket p
 pip install -r requirements.txt
 ```
 
-AetherNode depends on two third-party packages, both listed in `requirements.txt`. The `cryptography` library provides every cryptographic primitive used across the project: signature verification in `relay.py`, the full encryption and signing pipeline in `client.py`, and relay identity and certificate generation in `gossip.py`. `PySocks` is used by `client.py` to speak the SOCKS5 protocol to Tor, and, since a relay now dials its own peers over Tor to gossip, by `relay.py` as well when running in the default `tor` gossip transport; a relay running purely in the test-only `direct` transport never needs it. `protocol.py`, which holds the padding bucket sizes and the derived request-size limit shared between `client.py` and `relay.py`, depends on nothing beyond the Python standard library. Everything else involved, including the HTTP server, SQLite storage, JSON handling, TLS, and socket plumbing, comes from the standard library that ships with Python.
+AetherNode depends on two third-party packages, both listed in `requirements.txt`. The `cryptography` library provides every cryptographic primitive used across the project: signature verification in `relay.py`, the full encryption and signing pipeline in `client.py`, and relay identity and certificate generation in `gossip.py`. `PySocks` is used by `client.py` to speak the SOCKS5 protocol to Tor, and, since a relay now dials its own peers over Tor to gossip, by `relay.py` as well when running in the default `tor` gossip transport; a relay running purely in the test-only `direct` transport never needs it. `protocol.py`, which holds the padding bucket sizes and the derived request-size limit shared between `client.py` and `relay.py`, depends on nothing beyond the Python standard library. Everything else involved, including the HTTP server, SQLite storage, JSON handling, TLS, and socket plumbing, comes from the standard library that ships with Python. Python 3.11 or newer is required, since the codebase uses the `X | Y` union-type annotation syntax throughout and relies on 3.11's more permissive `datetime.fromisoformat` parsing; this is enforced in practice by the CI matrix described below rather than a version check anywhere in the code itself.
+
+---
+
+## Continuous Integration
+
+Every push and pull request against `main` runs two jobs, defined in `.github/workflows/ci.yml`. The first, smoke, runs `smoke_test.py` across a matrix of Linux, macOS, and Windows on Python 3.11 through 3.13; this is pure logic and real on-disk SQLite with no sockets involved, so it genuinely runs everywhere and finishes in seconds, and it is what actually caught this project's Windows-importability requirements being honest rather than aspirational. The second, integration, runs only on Linux, because it is the first environment in this project's history able to actually execute the AF_UNIX-dependent scripts that Windows sandboxes throughout this project's development could only ever compile-check: `simulate_partition.py`, `stress_test_quota.py`, and `stress_test_quota_multiday.py`, all launching real `relay.py` subprocesses over real Unix domain sockets. These run at a reduced scale by default so a normal push gets feedback in a few minutes rather than the better part of an hour; the same workflow accepts a manual `workflow_dispatch` run with `full_scale` set to exercise the full 50-relay, 10,000-message, 250-message-per-day-bucket versions these scripts were originally designed around. Both the reduced and full scale exercise the identical code paths and assertions — only the volume changes, controlled by environment variables (`AETHERNODE_SIM_NUM_RELAYS`, `AETHERNODE_STRESS_NUM_MESSAGES`, `AETHERNODE_AMPLIFICATION_MESSAGES_PER_DAY`) each script reads with its documented full-scale default preserved as the fallback for anyone running them directly and manually.
 
 ---
 

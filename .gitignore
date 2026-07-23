@@ -1,6 +1,8 @@
 __pycache__/
 *.pyc
 aether.db
+*.db-journal
+_smoke_*.db*
 *.sock
 *.sock.lock
 aether-relay-identity/

@@ -56,9 +56,12 @@ import gossip   # noqa: E402
 import protocol  # noqa: E402
 from cryptography.hazmat.primitives.asymmetric import rsa  # noqa: E402
 
-RETENTION_DAYS = 5
-QUOTA_MAX_MESSAGES = 200
-MESSAGES_ATTEMPTED_PER_DAY = 250  # > quota, so each day-bucket's cap is actually reached
+# Overridable via env vars so CI can run a faster-but-still-real version on
+# every push (see .github/workflows/ci.yml) while a manual/local run still
+# defaults to the scale this demonstration was designed to use.
+RETENTION_DAYS = int(os.environ.get("AETHERNODE_AMPLIFICATION_RETENTION_DAYS", "5"))
+QUOTA_MAX_MESSAGES = int(os.environ.get("AETHERNODE_AMPLIFICATION_QUOTA_MAX_MESSAGES", "200"))
+MESSAGES_ATTEMPTED_PER_DAY = int(os.environ.get("AETHERNODE_AMPLIFICATION_MESSAGES_PER_DAY", "250"))
 STARTUP_TIMEOUT_S = 10
 
 
