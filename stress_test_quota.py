@@ -31,6 +31,7 @@ capped at the same relay-wide limit with zero cross-interference, relay
 stayed responsive throughout), 1 otherwise.
 """
 
+import base64
 import http.client
 import json
 import os
@@ -48,6 +49,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 import client   # noqa: E402  (path must be set up first)
 import gossip   # noqa: E402
+import protocol  # noqa: E402
 from cryptography.hazmat.primitives.asymmetric import rsa  # noqa: E402
 
 NUM_MESSAGES         = 10_000
@@ -94,7 +96,9 @@ def _build_junk_payload(sender_priv, recipient_pub_b64: str, index: int) -> dict
     payload = {
         "version": "1",
         "sender_pubkey": client.pubkey_to_b64(sender_priv.public_key()),
-        "recipient_id": client.pubkey_address(recipient_pub_b64),
+        "recipient_id": protocol.blind_recipient_id(
+            base64.b64decode(recipient_pub_b64), protocol.day_bucket(datetime.now(timezone.utc))
+        ),
         "encrypted_key": enc["encrypted_key"],
         "nonce": enc["nonce"],
         "ciphertext": enc["ciphertext"],
@@ -218,8 +222,11 @@ def main() -> int:
             # Verified directly via /fetch rather than derived from the
             # accepted/rejected counters above, so this also exercises the
             # real read path, not just the write path.
+            recipient_id = protocol.blind_recipient_id(
+                base64.b64decode(pub_b64), protocol.day_bucket(datetime.now(timezone.utc))
+            )
             status, fetch_result = _unix_request(
-                str(socket_path), "GET", f"/fetch?id={client.pubkey_address(pub_b64)}"
+                str(socket_path), "POST", "/fetch", {"ids": [recipient_id]}
             )
             if status != 200:
                 print(f"FAIL: could not fetch {label}'s inbox for verification: {status}", file=sys.stderr)

@@ -40,6 +40,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
+import protocol
 import ratelimit
 
 # ─── Constants ──────────────────────────────────────────────────────────────
@@ -538,7 +539,8 @@ class GossipHandler(BaseHTTPRequestHandler):
 
         # Last gate before insert, now that the signature (and therefore
         # recipient_id) is verified genuine — see resolve_deletion_request.
-        if resolve_deletion_request(self.server.db, self.server.db_lock, payload["signature"], payload["recipient_id"]):
+        if resolve_deletion_request(self.server.db, self.server.db_lock, payload["signature"],
+                                     payload["recipient_id"], self.server.max_ttl_seconds):
             self._send_json(200, {"status": "discarded"})
             return
 
@@ -587,7 +589,8 @@ class GossipHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": error})
             return
 
-        response, did_confirm = handle_delete_request(self.server.db, self.server.db_lock, payload)
+        response, did_confirm = handle_delete_request(self.server.db, self.server.db_lock, payload,
+                                                        self.server.max_ttl_seconds)
         self._send_json(200, response)
 
         if did_confirm and self.server.gossip_ctx is not None:
@@ -730,19 +733,30 @@ def check_recipient_quota(db: sqlite3.Connection, db_lock: threading.Lock, recip
         return total_bytes < max_bytes
 
 
-def pubkey_address(pubkey_b64: str) -> str:
+def _candidate_recipient_ids(pubkey_der: bytes, max_ttl_seconds: int) -> list[str]:
     """
-    Relay-side twin of client.py's function of the same name (duplicated,
-    not imported — gossip.py must never import client.py). Derives the same
-    routing address a client computes from its own public key, so a delete
-    request's claimed recipient_pubkey can be checked against a stored
-    message's recipient_id.
+    Relay-side twin of client.py's _candidate_recipient_ids: every
+    blind_recipient_id a message from this pubkey could still legitimately
+    be using — today's, plus one for every day back through the relay's own
+    retention window, plus a one-day buffer for clock skew. Used to
+    authorize a delete request (and to resolve a pending one) without the
+    relay ever needing to be told which specific day a message was actually
+    addressed with — it just tries the small, bounded set of possibilities
+    itself. Pure in-memory HMAC work; callers must compute this BEFORE
+    acquiring db_lock, not inside it, so a delete request's day-search never
+    extends the critical section that serializes every other in-flight
+    relay operation.
     """
-    return hashlib.sha256(base64.b64decode(pubkey_b64)).hexdigest()
+    lookback_days = -(-max_ttl_seconds // 86400) + 1  # ceil(max_ttl/86400) + 1-day buffer
+    now = datetime.now(timezone.utc)
+    return [
+        protocol.blind_recipient_id(pubkey_der, protocol.day_bucket(now - timedelta(days=offset)))
+        for offset in range(lookback_days + 1)  # inclusive of today
+    ]
 
 
 def resolve_deletion_request(db: sqlite3.Connection, db_lock: threading.Lock,
-                               signature: str, recipient_id: str) -> bool:
+                               signature: str, recipient_id: str, max_ttl_seconds: int) -> bool:
     """
     Checked as the LAST gate before inserting a genuinely new message —
     after signature verification, not before. A delete request can outrun
@@ -772,29 +786,32 @@ def resolve_deletion_request(db: sqlite3.Connection, db_lock: threading.Lock,
     """
     with db_lock:
         row = db.execute(
-            "SELECT confirmed, requester_recipient_id FROM deletion_requests WHERE target_signature = ?",
+            "SELECT confirmed, requester_pubkey FROM deletion_requests WHERE target_signature = ?",
             (signature,)
         ).fetchone()
-        if row is None:
-            return False
-
-        confirmed, requester_recipient_id = row
-        if confirmed:
-            return True
-
-        if requester_recipient_id == recipient_id:
-            db.execute(
-                "UPDATE deletion_requests SET confirmed = 1 WHERE target_signature = ?", (signature,)
-            )
-            db.commit()
-            return True
-
-        db.execute("DELETE FROM deletion_requests WHERE target_signature = ?", (signature,))
-        db.commit()
+    if row is None:
         return False
 
+    confirmed, requester_pubkey = row
+    if confirmed:
+        return True
 
-def handle_delete_request(db: sqlite3.Connection, db_lock: threading.Lock, payload: dict) -> tuple[dict, bool]:
+    # Computed outside db_lock, between the read above and the write below —
+    # same lock-discipline reasoning as handle_delete_request.
+    candidate_ids = _candidate_recipient_ids(base64.b64decode(requester_pubkey), max_ttl_seconds)
+    matched = recipient_id in candidate_ids
+
+    with db_lock:
+        if matched:
+            db.execute("UPDATE deletion_requests SET confirmed = 1 WHERE target_signature = ?", (signature,))
+        else:
+            db.execute("DELETE FROM deletion_requests WHERE target_signature = ?", (signature,))
+        db.commit()
+    return matched
+
+
+def handle_delete_request(db: sqlite3.Connection, db_lock: threading.Lock, payload: dict,
+                           max_ttl_seconds: int) -> tuple[dict, bool]:
     """
     Processes an already-validated (structural fields + the request's own
     self-signature) delete request. Used by both this relay's client-facing
@@ -802,30 +819,47 @@ def handle_delete_request(db: sqlite3.Connection, db_lock: threading.Lock, paylo
     identical payload verbatim (mirroring how /gossip/publish forwards an
     original client-signed publish unchanged).
 
+    recipient_id now rotates daily (see protocol.blind_recipient_id), so a
+    single static equality check against the row's recipient_id is no
+    longer possible — the relay doesn't know which day the target message
+    was addressed with. Since the row is already found by target_signature
+    (unique, day-independent), authorization instead tries every day the
+    requester's own pubkey could plausibly have produced within the
+    retention window (a small, bounded set — see _candidate_recipient_ids)
+    and checks the found row's recipient_id against that set.
+
     Returns (response_body, did_confirm) — did_confirm tells the caller
     whether to schedule mesh-wide fan-out of this same request to trusted
     peers; only a locally-confirmed delete needs to propagate.
     """
     target_signature = payload["target_signature"]
     requester_pubkey = payload["recipient_pubkey"]
-    requester_recipient_id = pubkey_address(requester_pubkey)
     now = datetime.now(timezone.utc).isoformat()
+
+    # Computed BEFORE acquiring db_lock — pure in-memory HMAC work over a
+    # small, bounded set of candidate days, must not extend the critical
+    # section that serializes every other in-flight relay operation.
+    candidate_ids = set(_candidate_recipient_ids(base64.b64decode(requester_pubkey), max_ttl_seconds))
 
     with db_lock:
         row = db.execute(
             "SELECT recipient_id FROM messages WHERE signature = ?", (target_signature,)
         ).fetchone()
 
-        if row is not None and row[0] == requester_recipient_id:
+        if row is not None and row[0] in candidate_ids:
             # Authorized: secure-delete the message (PRAGMA secure_delete +
             # journal_mode=TRUNCATE, set in init_db, make this an actual
             # overwrite, not just a freed page), write a confirmed tombstone.
+            # requester_recipient_id is stored as the actually-matched
+            # recipient_id for reference; nothing reads this column back —
+            # authorization for a FUTURE lookup on this same signature is
+            # decided by target_signature/confirmed alone.
             db.execute("DELETE FROM messages WHERE signature = ?", (target_signature,))
             db.execute(
                 "INSERT OR REPLACE INTO deletion_requests "
                 "(target_signature, requester_pubkey, requester_recipient_id, confirmed, requested_at) "
                 "VALUES (?, ?, ?, 1, ?)",
-                (target_signature, requester_pubkey, requester_recipient_id, now),
+                (target_signature, requester_pubkey, row[0], now),
             )
             db.commit()
             return {"status": "deleted", "propagation": "async"}, True
@@ -838,15 +872,17 @@ def handle_delete_request(db: sqlite3.Connection, db_lock: threading.Lock, paylo
         if row is None:
             # Record a PENDING request (unverified — there's nothing to
             # check ownership against yet) so a later arrival is still
-            # caught by resolve_deletion_request. INSERT OR IGNORE: a
-            # confirmed or pending row may already exist for this exact
-            # signature (a repeat request, or the echo of this relay's own
-            # earlier fan-out); never downgrade an existing confirmed row.
+            # caught by resolve_deletion_request, which redoes this same
+            # day-search once the real recipient_id is known. INSERT OR
+            # IGNORE: a confirmed or pending row may already exist for this
+            # exact signature (a repeat request, or the echo of this
+            # relay's own earlier fan-out); never downgrade an existing
+            # confirmed row.
             db.execute(
                 "INSERT OR IGNORE INTO deletion_requests "
                 "(target_signature, requester_pubkey, requester_recipient_id, confirmed, requested_at) "
                 "VALUES (?, ?, ?, 0, ?)",
-                (target_signature, requester_pubkey, requester_recipient_id, now),
+                (target_signature, requester_pubkey, "", now),
             )
             db.commit()
         return {"status": "delete_requested"}, False
@@ -1022,6 +1058,7 @@ class AntiEntropySync:
                  direct_transport_unlocked: bool, max_body_bytes: int,
                  gossip_pull_limiter: "ratelimit.RateLimiter",
                  recipient_quota_max_messages: int, recipient_quota_max_bytes: int,
+                 max_ttl_seconds: int,
                  interval_s: int = DEFAULT_ANTI_ENTROPY_INTERVAL):
         self.db = db
         self.db_lock = db_lock
@@ -1035,6 +1072,7 @@ class AntiEntropySync:
         self.gossip_pull_limiter = gossip_pull_limiter
         self.recipient_quota_max_messages = recipient_quota_max_messages
         self.recipient_quota_max_bytes = recipient_quota_max_bytes
+        self.max_ttl_seconds = max_ttl_seconds
         self.interval_s = interval_s
         # Keyed by peer.fingerprint (the value load_peers() actually
         # validates as unique), not peer.label — a free-text field two
@@ -1137,7 +1175,8 @@ class AntiEntropySync:
 
                 # Last gate before insert, now that the signature is
                 # verified genuine — see resolve_deletion_request.
-                if resolve_deletion_request(self.db, self.db_lock, signature, payload["recipient_id"]):
+                if resolve_deletion_request(self.db, self.db_lock, signature,
+                                             payload["recipient_id"], self.max_ttl_seconds):
                     continue
 
                 received_at = datetime.now(timezone.utc).isoformat()

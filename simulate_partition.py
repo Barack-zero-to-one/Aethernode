@@ -22,6 +22,7 @@ Exits 0 if every posted message is recoverable from the surviving relays
 after the kill, 1 otherwise (with the specific missing messages listed).
 """
 
+import base64
 import http.client
 import json
 import os
@@ -41,6 +42,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 import client   # noqa: E402  (path must be set up first)
 import gossip   # noqa: E402
+import protocol  # noqa: E402
 from cryptography.hazmat.primitives.asymmetric import rsa  # noqa: E402
 
 NUM_RELAYS       = 50
@@ -114,7 +116,9 @@ def _build_signed_payload(sender_priv, recipient_pub_b64: str, message: str) -> 
     payload = {
         "version": "1",
         "sender_pubkey": client.pubkey_to_b64(sender_priv.public_key()),
-        "recipient_id": client.pubkey_address(recipient_pub_b64),
+        "recipient_id": protocol.blind_recipient_id(
+            base64.b64decode(recipient_pub_b64), protocol.day_bucket(datetime.now(timezone.utc))
+        ),
         "encrypted_key": enc["encrypted_key"],
         "nonce": enc["nonce"],
         "ciphertext": enc["ciphertext"],
@@ -214,7 +218,9 @@ def main() -> int:
         sender_priv = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         recipient_priv = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         recipient_pub_b64 = client.pubkey_to_b64(recipient_priv.public_key())
-        recipient_address = client.pubkey_address(recipient_pub_b64)
+        recipient_address = protocol.blind_recipient_id(
+            base64.b64decode(recipient_pub_b64), protocol.day_bucket(datetime.now(timezone.utc))
+        )
 
         posted: dict[int, str] = {}
         print(f"Posting {NUM_TEST_MESSAGES} messages across {NUM_RELAYS} origin relays...")
@@ -250,7 +256,7 @@ def main() -> int:
         for i in survivor_indices:
             node = nodes[i]
             try:
-                status, result = _unix_request(str(node.socket_path), "GET", f"/fetch?id={recipient_address}")
+                status, result = _unix_request(str(node.socket_path), "POST", "/fetch", {"ids": [recipient_address]})
             except OSError:
                 continue
             if status != 200:
