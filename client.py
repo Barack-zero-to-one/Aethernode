@@ -37,6 +37,20 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from protocol import PAD_BUCKETS, blind_recipient_id, day_bucket
 
+# Every status line below uses ANSI color codes and a few Unicode symbols
+# (checkmarks, crosses). A legacy 8-bit console encoding (cp1252, still the
+# DEFAULT on native Windows -- including GitHub Actions' own windows-latest
+# runners, confirmed by an actual CI failure, not a theoretical concern)
+# cannot represent those symbols at all, and a bare print() crashes with
+# UnicodeEncodeError instead of just looking wrong. Reconfiguring at import
+# time, not only inside main(), because tests and other code can call this
+# module's functions directly without ever going through main().
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass  # reconfigure() unavailable, or this stream doesn't support it — best effort only
+
 # Default lifetime of a sent message before the relay purges it, in seconds
 # (7 days). Overridable per-send with --ttl-seconds; the relay independently
 # enforces its own --min-ttl/--max-ttl bounds regardless of what a client

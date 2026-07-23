@@ -37,6 +37,19 @@ import gossip
 import ratelimit
 from protocol import MAX_PUBLISH_BODY_BYTES
 
+# gossip.py's own print statements (e.g. its relay-key-unencrypted warning)
+# share this same process's stdout/stderr, so reconfiguring here covers
+# them too. See client.py's identical block for the full rationale — a
+# legacy 8-bit console encoding (cp1252, still the default on native
+# Windows, including GitHub Actions' windows-latest runners, confirmed by
+# an actual CI failure) can't represent this codebase's Unicode symbols at
+# all and crashes instead of printing them.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 # Maximum bytes accepted from a single POST body — guards against memory
 # exhaustion. Derived from protocol.MAX_PUBLISH_BODY_BYTES (the worst-case
 # payload size for client.py's largest padding bucket) with roughly 50%
