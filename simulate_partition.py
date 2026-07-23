@@ -45,7 +45,10 @@ import gossip   # noqa: E402
 import protocol  # noqa: E402
 from cryptography.hazmat.primitives.asymmetric import rsa  # noqa: E402
 
-NUM_RELAYS       = 50
+# Overridable via env vars so CI can run a faster-but-still-real version on
+# every push (see .github/workflows/ci.yml) while a manual/local run still
+# defaults to the full scale this simulation was designed to demonstrate.
+NUM_RELAYS       = int(os.environ.get("AETHERNODE_SIM_NUM_RELAYS", "50"))
 KILL_FRACTION    = 0.5
 NUM_TEST_MESSAGES = 15   # kept modest: full-mesh push gossip is O(N^2) real
                           # mTLS handshakes per message, and this is meant to
