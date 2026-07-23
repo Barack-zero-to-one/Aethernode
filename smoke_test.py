@@ -17,7 +17,9 @@ Run directly with:
 import base64
 import json
 import os
+import shutil
 import sys
+import tempfile
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -405,6 +407,198 @@ def main() -> int:
     check("marker is ABSENT from raw file bytes after secure delete", marker.encode() not in raw_bytes_after)
 
     audit_db_path.unlink()
+
+    # ─── 8. client.py identity key passphrase round-trip ───────────────────
+    print("\n[8] client.py identity key encryption (passphrase round-trip)")
+
+    key_test_home = Path(tempfile.mkdtemp(prefix="aethernode-smoke-keyhome-"))
+    orig_home = client._KEY_DIR
+    orig_priv = client.PRIV_KEY_FILE
+    orig_pub = client.PUB_KEY_FILE
+    try:
+        client._KEY_DIR = key_test_home
+        client.PRIV_KEY_FILE = key_test_home / "identity.pem"
+        client.PUB_KEY_FILE = key_test_home / "identity.pub"
+
+        os.environ["_SMOKE_TEST_PASSPHRASE"] = "correct-horse-battery-staple"
+        priv1 = client.load_or_generate_identity("_SMOKE_TEST_PASSPHRASE")
+        check("generated key with a passphrase", client.PRIV_KEY_FILE.exists())
+
+        priv2 = client.load_or_generate_identity("_SMOKE_TEST_PASSPHRASE")
+        check("reload with correct passphrase succeeds and matches",
+              priv1.private_numbers() == priv2.private_numbers())
+
+        os.environ["_SMOKE_TEST_PASSPHRASE"] = "wrong-passphrase"
+        wrong_pw_rejected = False
+        try:
+            client.load_or_generate_identity("_SMOKE_TEST_PASSPHRASE")
+        except SystemExit:
+            wrong_pw_rejected = True
+        check("reload with wrong passphrase fails cleanly (not silently accepted)", wrong_pw_rejected)
+    finally:
+        client._KEY_DIR = orig_home
+        client.PRIV_KEY_FILE = orig_priv
+        client.PUB_KEY_FILE = orig_pub
+        os.environ.pop("_SMOKE_TEST_PASSPHRASE", None)
+        shutil.rmtree(key_test_home, ignore_errors=True)
+
+    key_test_home2 = Path(tempfile.mkdtemp(prefix="aethernode-smoke-keyhome-"))
+    try:
+        client._KEY_DIR = key_test_home2
+        client.PRIV_KEY_FILE = key_test_home2 / "identity.pem"
+        client.PUB_KEY_FILE = key_test_home2 / "identity.pub"
+
+        priv3 = client.load_or_generate_identity(None)  # no --key-passphrase-env at all
+        priv4 = client.load_or_generate_identity(None)
+        check("unencrypted key (no passphrase requested) still round-trips — backward compatible default",
+              priv3.private_numbers() == priv4.private_numbers())
+    finally:
+        client._KEY_DIR = orig_home
+        client.PRIV_KEY_FILE = orig_priv
+        client.PUB_KEY_FILE = orig_pub
+        shutil.rmtree(key_test_home2, ignore_errors=True)
+
+    # ─── 9. gossip.py relay identity key passphrase round-trip ─────────────
+    print("\n[9] gossip.py relay identity key encryption (passphrase round-trip)")
+
+    relay_id_dir = Path(tempfile.mkdtemp(prefix="aethernode-smoke-relayid-")) / "identity"
+    try:
+        os.environ["_SMOKE_RELAY_PASSPHRASE"] = "another-correct-horse"
+        key_path1, cert_path1, pw1 = gossip.load_or_generate_relay_identity(relay_id_dir, "_SMOKE_RELAY_PASSPHRASE")
+        check("generated relay key with a passphrase", key_path1.exists() and pw1 == b"another-correct-horse")
+
+        key_path2, cert_path2, pw2 = gossip.load_or_generate_relay_identity(relay_id_dir, "_SMOKE_RELAY_PASSPHRASE")
+        check("reload with correct relay passphrase resolves the same password", pw2 == pw1)
+
+        # Confirm the on-disk key is genuinely encrypted (unencrypted
+        # loading must fail), and that build_server_ssl_context's
+        # load_cert_chain path actually accepts the resolved password.
+        from cryptography.hazmat.primitives import serialization as _ser
+        unencrypted_load_failed = False
+        try:
+            _ser.load_pem_private_key(key_path1.read_bytes(), password=None)
+        except TypeError:
+            unencrypted_load_failed = True
+        check("relay key on disk is genuinely encrypted (password=None load fails)", unencrypted_load_failed)
+
+        dummy_trust_store = gossip.TrustStore(Path("__nonexistent_peers.json__"), Path("__nonexistent_blacklist.json__"))
+        ssl_ctx = gossip.build_server_ssl_context(cert_path1, key_path1, dummy_trust_store, pw1)
+        check("build_server_ssl_context accepts the resolved relay key password", ssl_ctx is not None)
+    finally:
+        os.environ.pop("_SMOKE_RELAY_PASSPHRASE", None)
+        shutil.rmtree(relay_id_dir.parent, ignore_errors=True)
+
+    # ─── 10. Deletion anti-entropy: _apply_confirmed_deletion + /gossip/deletions query ──
+    print("\n[10] Deletion anti-entropy reconciliation (_apply_confirmed_deletion, cursor query)")
+
+    sync_db_path = REPO_ROOT / "_smoke_deletion_sync_test.db"
+    if sync_db_path.exists():
+        sync_db_path.unlink()
+    db = relay.init_db(str(sync_db_path))
+    lock = threading.Lock()
+
+    msg = build_signed_payload(sender_priv, recipient_pub_b64, "reconcile me", ttl_seconds=3600)
+    gossip.insert_message_and_maybe_gossip(db, lock, msg, recipient_id, now, None)
+    row = db.execute("SELECT 1 FROM messages WHERE signature=?", (msg["signature"],)).fetchone()
+    check("setup: message present before reconciliation", row is not None)
+
+    # Simulate what AntiEntropySync._sync_deletions_with_peer does after
+    # pulling ONE confirmed row from a peer, without needing a real socket:
+    # call the exact same shared helper it calls.
+    with lock:
+        gossip._apply_confirmed_deletion(
+            db, msg["signature"], "peer-supplied-requester-pubkey", "peer-supplied-recipient-id", now,
+        )
+        db.commit()
+    row = db.execute("SELECT 1 FROM messages WHERE signature=?", (msg["signature"],)).fetchone()
+    check("reconciled deletion removes the message this relay held", row is None)
+    row = db.execute(
+        "SELECT confirmed FROM deletion_requests WHERE target_signature=?", (msg["signature"],)
+    ).fetchone()
+    check("...and writes a confirmed tombstone locally", row is not None and row[0] == 1)
+
+    # Reconciling a deletion for a message this relay never had must still
+    # record the tombstone (so a later arrival is caught, and so it's
+    # available for THIS relay's own peers to pull in turn).
+    with lock:
+        gossip._apply_confirmed_deletion(
+            db, "signature-never-seen-here", "peer-pubkey", "peer-recipient-id", now,
+        )
+        db.commit()
+    row = db.execute(
+        "SELECT confirmed FROM deletion_requests WHERE target_signature=?", ("signature-never-seen-here",)
+    ).fetchone()
+    check("reconciling a deletion for an absent message still records the tombstone",
+          row is not None and row[0] == 1)
+
+    # The exact query /gossip/deletions runs: confirms the id-cursor
+    # pagination and the confirmed-only filter both behave correctly.
+    rows = db.execute(
+        "SELECT id, target_signature, requester_pubkey, requester_recipient_id, requested_at "
+        "FROM deletion_requests WHERE id > ? AND confirmed = 1 ORDER BY id ASC LIMIT ?",
+        (0, gossip.GOSSIP_PULL_BATCH_LIMIT),
+    ).fetchall()
+    check("/gossip/deletions query returns both confirmed tombstones", len(rows) == 2)
+
+    db.execute(
+        "INSERT INTO deletion_requests (target_signature, requester_pubkey, requester_recipient_id, confirmed, requested_at) "
+        "VALUES (?, ?, ?, 0, ?)",
+        ("still-pending-signature", "x", "", now),
+    )
+    db.commit()
+    rows_after_pending = db.execute(
+        "SELECT id FROM deletion_requests WHERE id > ? AND confirmed = 1 ORDER BY id ASC LIMIT ?",
+        (0, gossip.GOSSIP_PULL_BATCH_LIMIT),
+    ).fetchall()
+    check("/gossip/deletions query never returns a PENDING (unconfirmed) row",
+          len(rows_after_pending) == 2)
+
+    # Regression test for a bug the adversarial review caught: resolving a
+    # PENDING request to confirmed must assign it a FRESH id (via
+    # _apply_confirmed_deletion), not silently keep its original one via a
+    # plain UPDATE. A peer's anti-entropy cursor only advances based on ids
+    # it has actually seen in a confirmed=1 response; if a later-confirmed
+    # row kept an id lower than one the peer's cursor already passed (by
+    # seeing OTHER, higher-id rows get confirmed and synced first), that
+    # peer would never see it again.
+    late_pending_sig = "late-pending-signature"
+    db.execute(
+        "INSERT INTO deletion_requests (target_signature, requester_pubkey, requester_recipient_id, confirmed, requested_at) "
+        "VALUES (?, ?, ?, 0, ?)",
+        (late_pending_sig, recipient_pub_b64, "", now),
+    )
+    db.commit()
+    pending_id_before = db.execute(
+        "SELECT id FROM deletion_requests WHERE target_signature = ?", (late_pending_sig,)
+    ).fetchone()[0]
+
+    # Simulate OTHER, later-arriving confirmed deletions overtaking this
+    # still-pending row's id — exactly the ordering that triggered the bug:
+    # a peer's cursor advances past these higher ids on its next sync,
+    # before this pending row is ever resolved.
+    for i in range(3):
+        db.execute(
+            "INSERT INTO deletion_requests (target_signature, requester_pubkey, requester_recipient_id, confirmed, requested_at) "
+            "VALUES (?, ?, ?, 1, ?)",
+            (f"later-confirmed-sig-{i}", "x", "y", now),
+        )
+    db.commit()
+    simulated_peer_cursor = db.execute("SELECT MAX(id) FROM deletion_requests WHERE confirmed = 1").fetchone()[0]
+    check("setup: the pending row's original id is already behind a peer's simulated cursor",
+          pending_id_before <= simulated_peer_cursor)
+
+    discard = gossip.resolve_deletion_request(db, lock, late_pending_sig, recipient_id, default_max_ttl)
+    check("resolve_deletion_request confirms a matching pending request", discard is True)
+
+    resolved_id = db.execute(
+        "SELECT id, confirmed FROM deletion_requests WHERE target_signature = ?", (late_pending_sig,)
+    ).fetchone()
+    check("...and the confirmed row's id is now FRESH — past the peer's already-advanced cursor "
+          "(not stuck at its stale original id)",
+          resolved_id is not None and resolved_id[1] == 1 and resolved_id[0] > simulated_peer_cursor)
+
+    db.close()
+    sync_db_path.unlink()
 
     # ─── Summary ──────────────────────────────────────────────────────────
     print(f"\n{'=' * 60}")

@@ -17,6 +17,7 @@ Commands:
 
 import argparse
 import base64
+import getpass
 import http.client
 import json
 import os
@@ -68,7 +69,47 @@ PUB_KEY_FILE  = _KEY_DIR / "identity.pub"
 
 # ─── Key Management ───────────────────────────────────────────────────────────
 
-def _generate_keypair():
+def _resolve_passphrase(env_var_name: str | None, *, required: bool = False,
+                          confirm: bool = False) -> bytes | None:
+    """
+    Resolves a passphrase for encrypting/decrypting the identity key file.
+
+    required=False (used at generation time): returns None outright if
+    env_var_name is None -- "no --key-passphrase-env given" means the user
+    is opting out of encryption entirely, preserving this project's
+    original zero-friction default (a CLI tool re-invoked as a fresh
+    process on every command has no session/agent to cache a passphrase
+    across, so defaulting to *requiring* one on every single invocation
+    would be a real usability regression for what has always been a
+    low-friction tool -- this stays opt-in, like --delete-after-read and
+    the direct gossip transport before it).
+
+    required=True (used when loading a key already on disk that turns out
+    to be encrypted): always resolves an actual passphrase regardless of
+    what this particular invocation's flags said, since the key's own
+    on-disk format is authoritative, not this run's arguments.
+
+    Either way, checks the named environment variable first (so scripted/
+    automated use never has to prompt) and falls back to an interactive,
+    unechoed getpass() prompt -- a passphrase must never appear in shell
+    history or `ps` output, which is why this is an env-var *name* to look
+    up, never a literal CLI argument value.
+    """
+    if not required and env_var_name is None:
+        return None
+    raw = os.environ.get(env_var_name) if env_var_name else None
+    if raw is not None:
+        return raw.encode()
+    passphrase = getpass.getpass("  Enter your identity key passphrase: ")
+    if confirm:
+        again = getpass.getpass("  Confirm passphrase: ")
+        if passphrase != again:
+            print(f"\n  {RED}✗ Passphrases did not match.{RESET}\n")
+            sys.exit(1)
+    return passphrase.encode()
+
+
+def _generate_keypair(key_passphrase_env: str | None = None):
     """
     Generate RSA-2048 keypair and persist to KEY_DIR.
     Called automatically on first launch — no manual setup required.
@@ -76,11 +117,16 @@ def _generate_keypair():
     _KEY_DIR.mkdir(parents=True, exist_ok=True)
     private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 
+    passphrase = _resolve_passphrase(key_passphrase_env, confirm=True)
+    encryption = (
+        serialization.BestAvailableEncryption(passphrase)
+        if passphrase is not None else serialization.NoEncryption()
+    )
     PRIV_KEY_FILE.write_bytes(
         private_key.private_bytes(
             serialization.Encoding.PEM,
             serialization.PrivateFormat.PKCS8,
-            serialization.NoEncryption(),
+            encryption,
         )
     )
     PUB_KEY_FILE.write_bytes(
@@ -96,17 +142,31 @@ def _generate_keypair():
     except (AttributeError, NotImplementedError, OSError):
         pass
 
+    if passphrase is None:
+        print(f"  {YELLOW}! Private key stored unencrypted on disk. Anyone with filesystem "
+              f"access to it has your full identity. Use --key-passphrase-env to protect it "
+              f"with a passphrase — see README § Key Storage.{RESET}")
     print(f"  {GREEN}New identity generated.{RESET}  Key stored in {_KEY_DIR}")
     return private_key
 
 
-def load_or_generate_identity():
+def load_or_generate_identity(key_passphrase_env: str | None = None):
     """Load existing keypair or generate one on first launch."""
     if PRIV_KEY_FILE.exists() and PUB_KEY_FILE.exists():
-        return serialization.load_pem_private_key(
-            PRIV_KEY_FILE.read_bytes(), password=None
-        )
-    return _generate_keypair()
+        data = PRIV_KEY_FILE.read_bytes()
+        try:
+            return serialization.load_pem_private_key(data, password=None)
+        except TypeError:
+            # "Password was not given but private key is encrypted" -- the
+            # on-disk key needs a passphrase regardless of what this
+            # invocation's own flags said.
+            passphrase = _resolve_passphrase(key_passphrase_env, required=True)
+            try:
+                return serialization.load_pem_private_key(data, password=passphrase)
+            except (ValueError, TypeError) as exc:
+                print(f"\n  {RED}✗ Could not decrypt identity key: {exc}{RESET}\n")
+                sys.exit(1)
+    return _generate_keypair(key_passphrase_env)
 
 
 def pubkey_to_b64(public_key) -> str:
@@ -719,6 +779,12 @@ examples:
   AETHER_HOME=~/.aether_bob   python client.py register
         """,
     )
+    parser.add_argument(
+        "--key-passphrase-env", metavar="ENV_VAR", default=None,
+        help="Name of an environment variable holding a passphrase to encrypt/decrypt your "
+             "identity key at rest (e.g. --key-passphrase-env AETHER_KEY_PASSPHRASE). If the "
+             "named variable is unset, you'll be prompted interactively. Omitted by default, "
+             "which keeps the original unencrypted key file — see README § Key Storage.")
 
     sub = parser.add_subparsers(dest="command", metavar="command")
 
@@ -766,7 +832,7 @@ examples:
     SOCKS_PORT = getattr(args, "socks_port", DEFAULT_SOCKS_PORT)
 
     # Bootstrap identity — generates keys on first launch, silent on subsequent runs
-    private_key = load_or_generate_identity()
+    private_key = load_or_generate_identity(args.key_passphrase_env)
 
     if args.command == "register":
         cmd_register(private_key)
