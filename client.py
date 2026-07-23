@@ -17,7 +17,6 @@ Commands:
 
 import argparse
 import base64
-import hashlib
 import http.client
 import json
 import os
@@ -35,13 +34,20 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from protocol import PAD_BUCKETS
+from protocol import PAD_BUCKETS, blind_recipient_id, day_bucket
 
 # Default lifetime of a sent message before the relay purges it, in seconds
 # (7 days). Overridable per-send with --ttl-seconds; the relay independently
 # enforces its own --min-ttl/--max-ttl bounds regardless of what a client
 # requests.
 DEFAULT_TTL_SECONDS = 7 * 24 * 3600
+
+# Fallback lookback bound used by cmd_fetch if a relay's /health response
+# doesn't include max_ttl_seconds (an older, unupgraded relay) -- matches
+# relay.py's own DEFAULT_MAX_TTL_SECONDS so behavior against a current-
+# version relay that simply omitted the field for some other reason is
+# still correct.
+DEFAULT_MAX_TTL_SECONDS_FALLBACK = 30 * 24 * 3600
 
 # ─── Terminal Colors (ANSI — no external dependencies) ───────────────────────
 GREEN  = "\033[92m"
@@ -115,15 +121,6 @@ def pubkey_to_b64(public_key) -> str:
 def b64_to_pubkey(b64: str):
     """Deserialize base64-encoded DER string back to an RSA public key object."""
     return serialization.load_der_public_key(base64.b64decode(b64))
-
-
-def pubkey_address(pubkey_b64: str) -> str:
-    """
-    Derive a routing address (SHA-256 hex digest of the DER-encoded key) from a
-    base64 public key. The relay indexes and serves messages by this address —
-    it never sees a recipient's raw public key, only a one-way hash of it.
-    """
-    return hashlib.sha256(base64.b64decode(pubkey_b64)).hexdigest()
 
 
 # ─── Padding (Traffic Analysis Resistance) ────────────────────────────────────
@@ -532,15 +529,16 @@ def cmd_send(private_key, relay_url: str, recipient_b64: str, message: str, ttl_
     # Step 2: Build and sign payload
     print(f"  {DIM}[2/3] Signing     (RSA-PSS + SHA-256)...{RESET}", end=" ", flush=True)
     sender_b64 = pubkey_to_b64(private_key.public_key())
+    now = datetime.now(timezone.utc)
     payload = {
         "version":       "1",
         "sender_pubkey": sender_b64,
-        "recipient_id":  pubkey_address(recipient_b64),
+        "recipient_id":  blind_recipient_id(base64.b64decode(recipient_b64), day_bucket(now)),
         "encrypted_key": enc["encrypted_key"],
         "nonce":         enc["nonce"],
         "ciphertext":    enc["ciphertext"],
-        "timestamp":     datetime.now(timezone.utc).isoformat(),
-        "expires_at":    (datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)).isoformat(),
+        "timestamp":     now.isoformat(),
+        "expires_at":    (now + timedelta(seconds=ttl_seconds)).isoformat(),
     }
     payload["signature"] = sign_payload(payload, private_key)
     print(f"{GREEN}done{RESET}")
@@ -560,17 +558,47 @@ def cmd_send(private_key, relay_url: str, recipient_b64: str, message: str, ttl_
 
 # ─── Command: fetch ───────────────────────────────────────────────────────────
 
+def _candidate_recipient_ids(pubkey_der: bytes, max_ttl_seconds: int) -> list:
+    """
+    Every blind_recipient_id a message addressed to this identity could
+    still legitimately be using: today's, plus one for every day back
+    through the relay's own retention window (a message sent up to
+    max_ttl_seconds ago and not yet expired could have been addressed with
+    any of those days' identifiers), plus one extra buffer day for clock
+    skew between this client and whoever sent the message.
+    """
+    lookback_days = -(-max_ttl_seconds // 86400) + 1  # ceil(max_ttl/86400) + 1-day buffer
+    now = datetime.now(timezone.utc)
+    return [
+        blind_recipient_id(pubkey_der, day_bucket(now - timedelta(days=offset)))
+        for offset in range(lookback_days + 1)  # inclusive of today
+    ]
+
+
 def cmd_fetch(private_key, relay_url: str, delete_after_read: bool = False):
     """Fetch messages from the relay, verify signatures, and decrypt."""
     print(f"\n{BOLD}{CYAN}  AetherNode — Inbox{RESET}")
     print(f"  {'─' * 50}")
 
+    if delete_after_read:
+        print(f"  {YELLOW}! --delete-after-read reveals your permanent public key to the "
+              f"relay and its trusted peers for every message deleted this run — see README "
+              f"§ Data Retention.{RESET}")
+
     my_pubkey_b64 = pubkey_to_b64(private_key.public_key())
-    my_address    = pubkey_address(my_pubkey_b64)
-    url           = f"{relay_url}/fetch?id={my_address}"
+    my_pubkey_der = base64.b64decode(my_pubkey_b64)
 
     try:
-        result = _http_get(url)
+        health = _http_get(f"{relay_url}/health")
+    except ConnectionError as exc:
+        print(f"\n  {RED}✗ {exc}{RESET}\n")
+        sys.exit(1)
+    max_ttl_seconds = health.get("max_ttl_seconds", DEFAULT_MAX_TTL_SECONDS_FALLBACK)
+
+    candidate_ids = _candidate_recipient_ids(my_pubkey_der, max_ttl_seconds)
+
+    try:
+        result = _http_post(f"{relay_url}/fetch", {"ids": candidate_ids})
     except ConnectionError as exc:
         print(f"\n  {RED}✗ {exc}{RESET}\n")
         sys.exit(1)
@@ -646,6 +674,8 @@ def cmd_delete(private_key, relay_url: str, target_signature: str):
     """Send a signed, recipient-authorized deletion request for one message."""
     print(f"\n{BOLD}{CYAN}  AetherNode — Delete Request{RESET}")
     print(f"  {'─' * 50}")
+    print(f"  {YELLOW}! This reveals your permanent public key to the relay and its "
+          f"trusted peers, tied to this message — see README § Data Retention.{RESET}")
 
     payload = _build_delete_payload(private_key, target_signature)
 

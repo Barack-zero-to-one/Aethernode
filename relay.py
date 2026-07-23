@@ -28,7 +28,7 @@ import sys
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
@@ -72,6 +72,18 @@ DEFAULT_MIN_TTL_SECONDS = 60
 DEFAULT_MAX_TTL_SECONDS = 30 * 24 * 3600
 _MIN_TTL_SECONDS = DEFAULT_MIN_TTL_SECONDS
 _MAX_TTL_SECONDS = DEFAULT_MAX_TTL_SECONDS
+
+# A rotating-id fetch legitimately needs one id per day within the relay's
+# retention window (plus a small clock-skew buffer) -- a FIXED cap here
+# would silently break every /fetch once an operator sets --max-ttl above
+# whatever that fixed number covers (--max-ttl has no upper bound in
+# argparse). Instead this is computed in main() from the same formula
+# client.py's/gossip.py's _candidate_recipient_ids use
+# (ceil(max_ttl_seconds/86400) + 1-day buffer + 1 for today), so it can
+# never fall out of sync with the actual lookback window regardless of how
+# --max-ttl is configured. Read-only after main() sets it; a conservative
+# default here only matters for pure-logic testing that never calls main().
+_MAX_FETCH_IDS = -(-DEFAULT_MAX_TTL_SECONDS // 86400) + 2
 
 DEFAULT_CLEANUP_INTERVAL_SECONDS = 5 * 60
 DEFAULT_RECIPIENT_QUOTA_MAX_MESSAGES = 1000
@@ -347,27 +359,10 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
 
         if parsed.path == "/health":
-            self._send_json(200, {"status": "alive", "node": "AetherNode/1.0"})
-            return
-
-        if parsed.path == "/fetch":
-            params = parse_qs(parsed.query)
-            id_list = params.get("id", [])
-            if not id_list:
-                self._send_json(400, {"error": "Missing 'id' query parameter"})
-                return
-
-            recipient_id = id_list[0]
-            now = datetime.now(timezone.utc).isoformat()
-            with DB_LOCK:
-                rows = self.server.db.execute(
-                    "SELECT payload FROM messages "
-                    "WHERE recipient_id = ? AND expires_at > ? ORDER BY id ASC",
-                    (recipient_id, now)
-                ).fetchall()
-
-            messages = [json.loads(row[0]) for row in rows]
-            self._send_json(200, {"messages": messages, "count": len(messages)})
+            self._send_json(200, {
+                "status": "alive", "node": "AetherNode/1.0",
+                "min_ttl_seconds": _MIN_TTL_SECONDS, "max_ttl_seconds": _MAX_TTL_SECONDS,
+            })
             return
 
         self._send_json(404, {"error": "Not found"})
@@ -377,6 +372,8 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path == "/publish":
             self._do_publish()
+        elif self.path == "/fetch":
+            self._do_fetch()
         elif self.path == "/delete":
             self._do_delete()
         else:
@@ -456,7 +453,7 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
         # already the target of a confirmed or pending delete? See
         # gossip.resolve_deletion_request for why this must run AFTER
         # signature verification, not before.
-        if gossip.resolve_deletion_request(self.server.db, DB_LOCK, payload["signature"], payload["recipient_id"]):
+        if gossip.resolve_deletion_request(self.server.db, DB_LOCK, payload["signature"], payload["recipient_id"], _MAX_TTL_SECONDS):
             self._send_json(200, {"status": "discarded", "reason": "message was the target of a prior deletion request"})
             return
 
@@ -475,6 +472,60 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
         else:
             # Same signature already stored — a replayed or re-submitted message.
             self._send_json(409, {"error": "Message already published (duplicate signature)"})
+
+    def _do_fetch(self):
+        """
+        POST, not GET-with-query-string: a rotating recipient_id means a
+        client must ask for up to ~30 candidate day-buckets at once (see
+        client.py's _candidate_recipient_ids), and BaseHTTPRequestHandler's
+        inherited log_request() logs the full request line — including any
+        query string — through RelayHandler's own log_message override. A
+        GET with 30 ids in the query string would hand anyone with log
+        access the complete linkage across all of them in one line, which
+        is a WORSE leak than the static id it replaces. Request bodies are
+        never included in the logged request line, so POST closes this.
+        """
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            content_length = 0
+        if content_length > _MAX_BODY_BYTES:
+            self._send_json(413, {"error": f"Request body exceeds {_MAX_BODY_BYTES} bytes"})
+            return
+
+        raw = self._read_body(content_length)
+        if not raw:
+            self._send_json(400, {"error": "Empty request body"})
+            return
+
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            self._send_json(400, {"error": f"Invalid JSON: {exc}"})
+            return
+
+        ids = payload.get("ids")
+        if not isinstance(ids, list) or not ids or not all(isinstance(i, str) for i in ids):
+            self._send_json(400, {"error": "'ids' must be a non-empty list of strings"})
+            return
+        if len(ids) > _MAX_FETCH_IDS:
+            self._send_json(400, {"error": f"'ids' exceeds {_MAX_FETCH_IDS} entries"})
+            return
+        if any(not (0 < len(i) <= _MAX_RECIPIENT_ID_LEN) for i in ids):
+            self._send_json(400, {"error": "one or more 'ids' entries has an invalid length"})
+            return
+
+        now = datetime.now(timezone.utc).isoformat()
+        placeholders = ",".join("?" * len(ids))
+        with DB_LOCK:
+            rows = self.server.db.execute(
+                f"SELECT payload FROM messages "
+                f"WHERE recipient_id IN ({placeholders}) AND expires_at > ? ORDER BY id ASC",
+                (*ids, now)
+            ).fetchall()
+
+        messages = [json.loads(row[0]) for row in rows]
+        self._send_json(200, {"messages": messages, "count": len(messages)})
 
     def _do_delete(self):
         try:
@@ -511,7 +562,7 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(429, {"error": "rate limit exceeded"})
             return
 
-        response, did_confirm = gossip.handle_delete_request(self.server.db, DB_LOCK, payload)
+        response, did_confirm = gossip.handle_delete_request(self.server.db, DB_LOCK, payload, _MAX_TTL_SECONDS)
         self._send_json(200, response)
 
         if did_confirm and self.server.gossip_ctx is not None:
@@ -685,15 +736,25 @@ def main():
                              f"(default: {DEFAULT_CLEANUP_INTERVAL_SECONDS}).")
     parser.add_argument("--recipient-quota-max-messages", type=int, default=DEFAULT_RECIPIENT_QUOTA_MAX_MESSAGES,
                         help="Maximum messages physically stored per recipient_id, regardless "
-                             f"of expiry status (default: {DEFAULT_RECIPIENT_QUOTA_MAX_MESSAGES}).")
+                             f"of expiry status (default: {DEFAULT_RECIPIENT_QUOTA_MAX_MESSAGES}). "
+                             "recipient_id now rotates daily (see README, Data Retention), so this "
+                             "is effectively a PER-DAY cap per recipient, not a lifetime one — the "
+                             "real worst case for one recipient is this value multiplied by "
+                             "ceil(--max-ttl / 1 day); keep --max-ttl small if you're relying on "
+                             "this as a DoS backstop.")
     parser.add_argument("--recipient-quota-max-bytes", type=int, default=DEFAULT_RECIPIENT_QUOTA_MAX_BYTES,
                         help="Maximum total payload bytes physically stored per recipient_id, "
-                             f"regardless of expiry status (default: {DEFAULT_RECIPIENT_QUOTA_MAX_BYTES}, 50 MiB).")
+                             f"regardless of expiry status (default: {DEFAULT_RECIPIENT_QUOTA_MAX_BYTES}, 50 MiB). "
+                             "Same per-day-not-lifetime caveat as --recipient-quota-max-messages applies.")
     args = parser.parse_args()
 
-    global _MIN_TTL_SECONDS, _MAX_TTL_SECONDS
+    global _MIN_TTL_SECONDS, _MAX_TTL_SECONDS, _MAX_FETCH_IDS
     _MIN_TTL_SECONDS = args.min_ttl
     _MAX_TTL_SECONDS = args.max_ttl
+    # Same formula as client.py's/gossip.py's _candidate_recipient_ids, so
+    # a /fetch request built for THIS relay's actual retention window can
+    # never be rejected for exceeding a cap sized for a different one.
+    _MAX_FETCH_IDS = -(-args.max_ttl // 86400) + 2
 
     if args.socket_path == args.gossip_socket_path:
         # _acquire_relay_lock is called once per path below; flock() locks
@@ -774,6 +835,7 @@ def main():
             interval_s=args.gossip_anti_entropy_interval,
             recipient_quota_max_messages=args.recipient_quota_max_messages,
             recipient_quota_max_bytes=args.recipient_quota_max_bytes,
+            max_ttl_seconds=args.max_ttl,
         )
 
         cleanup_job = _CleanupJob(
@@ -802,6 +864,7 @@ def main():
         gossip_server.gossip_push_limiter = gossip_push_limiter
         gossip_server.recipient_quota_max_messages = args.recipient_quota_max_messages
         gossip_server.recipient_quota_max_bytes = args.recipient_quota_max_bytes
+        gossip_server.max_ttl_seconds = args.max_ttl
 
         gossip_thread = threading.Thread(target=gossip_server.serve_forever, daemon=True, name="gossip-listener")
         gossip_thread.start()
@@ -819,8 +882,12 @@ def main():
         print(f"  Trusted peers     : {peer_count}")
         print(f"  Storage           : {args.db}")
         print(f"  TTL bounds        : {args.min_ttl}s – {args.max_ttl}s")
+        _quota_days = -(-args.max_ttl // 86400)  # ceil(max_ttl / 1 day)
         print(f"  Recipient quota   : {args.recipient_quota_max_messages} messages / "
-              f"{args.recipient_quota_max_bytes} bytes")
+              f"{args.recipient_quota_max_bytes} bytes PER DAY (recipient_id rotates daily — "
+              f"real worst case per recipient over the {args.max_ttl}s retention window is "
+              f"{args.recipient_quota_max_messages * _quota_days} messages / "
+              f"{args.recipient_quota_max_bytes * _quota_days} bytes)")
         print(f"  Zero-Knowledge: relay cannot decrypt stored payloads")
         print(f"  No public network interface — reachable only via a Tor onion service.")
         print(f"  Press Ctrl+C to stop.\n")
